@@ -1,7 +1,7 @@
 # 美国（USA）数据源说明——regulations（行政系统规制）
 
 > 文中覆盖范围与数量为官方数据源的稳定特征，案例均为真实数据实例。
-> 阅读前提：了解 `python cli.py` 用法即可，不需要读代码。美国全部源总览见 [usa.md](./usa.md)。
+> 阅读前提：了解 `python cli.py` 用法即可，不需要读代码。美国全部源总览见 [overview-zh.md](./overview-zh.md)。英文版：[regulations-en.md](./regulations-en.md)。
 
 ## 1. 源概览
 

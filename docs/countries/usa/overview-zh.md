@@ -1,0 +1,34 @@
+# 美国（USA）数据源总览
+
+> 一个源一个文件：本文件只做总览与共享信息，各源细节见对应文件。
+> 文件命名规则：`{iso3}/{source}-{lang}.md`（国家文件夹 + 语言后缀，lang ∈ zh/en）；九节写作结构见 [_template-zh.md](../_template-zh.md)。英文版：[overview-en.md](./overview-en.md)。
+
+## 1. 源清单
+
+| 源 | 覆盖什么 | 数据从哪来 | 说明文件 |
+|---|---|---|---|
+| `bills` | 国会立法全流程：法案引入 → 委员会 → 表决 → 成法（含动作史、投票头、各版本文本） | congress.gov 官方 API v3（需免费 key） | [bills-zh.md](./bills-zh.md) |
+| `regulations` | 行政系统规制全生命周期：规制计划（统一议程）→ 白宫审查（OIRA）→ FR 出版（提案/终稿/纠错）→ 生效 | Federal Register API + reginfo.gov（均无需 key） | [regulations-zh.md](./regulations-zh.md) |
+
+两个源各自独立运行（`--source bills` / `--source regulations`），共用同一个 `state.db`：框架账（tasks/documents/kv/events）全体共享，领域表（bills 三表 + regulations 五表）由美国包统一建。
+
+## 2. 共享访问准备
+
+| 项 | 说明 |
+|---|---|
+| 数据目录 | `python cli.py init` 配置，或 `POLICY_DATA_ROOT` 环境变量；美国数据落在 `{data_root}/USA_policy/` |
+| 密钥 | 只 bills 需要：`.env` 写 `CONGRESS_API_KEY=…`（见 usa-bills.md 第 2 节）。regulations 全程无需 key |
+| 通用命令习惯 | `collect`（key=value 传参）/ `status` / `export` / `requeue` / `reset`，全部在仓库根目录 `python cli.py` 运行 |
+| 节奏 | 框架统一限速（请求间隔 0.5–1 秒随机）+ 错误三分法重试，撞限流自动放慢，数据不丢 |
+
+## 3. 尚未覆盖的政策层
+
+| 层 | 现状 |
+|---|---|
+| 规制评论 / 听证记录 | regulations.gov（需 api.data.gov key），数据路已探明（FR 详情带 docket 与跳转 URL），列为后续扩展 |
+| 部门指引层（guidance） | 未开工（FDA 等机构门户，网页抓取型） |
+| CFR（法规典成品） | 未开工（终稿生效后的汇编层） |
+
+---
+
+*更新日期：2026-08-27*

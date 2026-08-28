@@ -2,7 +2,7 @@
 
 > 文中数量为真实运行的实测参考值；你运行时的产出取决于所选届数与窗口。
 > 阅读前提：了解仓库根目录 `python cli.py` 的用法即可，不需要读代码。
-> 本文是 bills 单源的说明；美国全部源的总览见 [usa.md](./usa.md)。
+> 本文是 bills 单源的说明；美国全部源的总览见 [overview-zh.md](./overview-zh.md)。英文版：[bills-en.md](./bills-en.md)。
 
 ## 1. 源概览
 
