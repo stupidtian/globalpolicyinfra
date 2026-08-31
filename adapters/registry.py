@@ -29,7 +29,17 @@ def discover() -> dict[tuple[str, str], SourceDefinition]:
     for module_info in pkgutil.iter_modules(adapters.__path__):
         if not module_info.ispkg:
             continue
-        module: Any = importlib.import_module(f"adapters.{module_info.name}")
+        try:
+            module: Any = importlib.import_module(f"adapters.{module_info.name}")
+        except Exception as exc:  # noqa: BLE001 — tolerate in-flight packs
+            # Multi-agent reality: another pack's work-in-progress must not
+            # take down discovery for every country. Skipped loudly.
+            print(
+                f"[registry] skipping adapters/{module_info.name}/ "
+                f"(import failed: {type(exc).__name__}: {exc})",
+                flush=True,
+            )
+            continue
         country = getattr(module, "COUNTRY_CODE", None)
         sources = getattr(module, "SOURCES", None)
         if not country or not isinstance(sources, dict) or not sources:

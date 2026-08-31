@@ -207,4 +207,4 @@ python cli.py requeue --country usa
 
 ---
 
-*更新日期：2026-08-27*
+*更新日期：2026-08-30（规范翻新，内容未动）；数据快照：2026-08-27；数据由规制全生命周期三链实跑背书（1,233 任务全 done：rulemakings 46,562 / ua_entries 241,726 / oira_reviews 44,586 / FR 出版 739+498）。*
