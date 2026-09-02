@@ -24,7 +24,7 @@ import gzip
 import hashlib
 import json
 import sqlite3
-from collections.abc import Iterator, Mapping, Sequence
+from collections.abc import Collection, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Self, cast
@@ -229,17 +229,55 @@ class StateStore:
         record["params"] = json.loads(record["params"])
         return record
 
-    def iter_due_tasks(self, now: str | None = None) -> list[str]:
+    def iter_due_tasks(
+        self, now: str | None = None, *, types: Collection[str] | None = None
+    ) -> list[str]:
         """Task ids the engine may run: pending, or retry whose scheduled
-        time has come. Ordered by creation time (oldest work first)."""
+        time has come. Ordered by creation time (oldest work first).
+
+        With ``types`` (the running source's task-type set) only tasks of
+        those types are returned — other sources' tasks stay in the ledger
+        untouched. This fetch-layer filter is the main defense against the
+        2026-09-01 cross-source kill (794 tasks; architecture ruling
+        2026-09-02). ``None`` keeps the unfiltered behavior.
+        """
         now = now or utc_now_iso()
-        rows = self._conn.execute(
+        params: list[Any] = [Status.PENDING.value, Status.RETRY.value, now]
+        query = (
             "SELECT task_id FROM tasks "
-            "WHERE status = ? OR (status = ? AND (next_attempt_at IS NULL OR next_attempt_at <= ?)) "
-            "ORDER BY created_at, task_id",
-            (Status.PENDING.value, Status.RETRY.value, now),
-        ).fetchall()
+            "WHERE (status = ? OR (status = ? AND (next_attempt_at IS NULL OR next_attempt_at <= ?))) "
+        )
+        if types is not None:
+            if not types:
+                return []
+            placeholders = ", ".join("?" for _ in types)
+            query += f"AND type IN ({placeholders}) "
+            params.extend(types)
+        query += "ORDER BY created_at, task_id"
+        rows = self._conn.execute(query, params).fetchall()
         return [row["task_id"] for row in rows]
+
+    def foreign_due_tasks(
+        self, own_types: Collection[str], now: str | None = None
+    ) -> dict[str, list[str]]:
+        """Due tasks whose type is NOT in ``own_types``, grouped by type —
+        the engine's material for the foreign-task warning and audit note
+        (ruling 2026-09-02). The id list doubles as count and examples."""
+        now = now or utc_now_iso()
+        params: list[Any] = [Status.PENDING.value, Status.RETRY.value, now]
+        query = (
+            "SELECT type, task_id FROM tasks "
+            "WHERE (status = ? OR (status = ? AND (next_attempt_at IS NULL OR next_attempt_at <= ?))) "
+        )
+        if own_types:
+            placeholders = ", ".join("?" for _ in own_types)
+            query += f"AND type NOT IN ({placeholders}) "
+            params.extend(own_types)
+        query += "ORDER BY created_at, task_id"
+        grouped: dict[str, list[str]] = {}
+        for row in self._conn.execute(query, params).fetchall():
+            grouped.setdefault(row["type"], []).append(row["task_id"])
+        return grouped
 
     def record_task_outcome(
         self,
@@ -385,6 +423,14 @@ class StateStore:
                 (key, value),
             )
 
+    def note_event(self, entity_type: str, subject_id: str, detail: str) -> None:
+        """Append one audit event outside any task lifecycle — engine-level
+        notes (foreign-task summaries, lock takeovers). Exists so callers
+        never touch the connection directly."""
+        now = utc_now_iso()
+        with self.transaction() as conn:
+            _append_event(conn, now, entity_type, subject_id, None, None, None, detail)
+
     # -- repair channel ---------------------------------------------------------------
 
     def requeue_tasks(
@@ -432,6 +478,38 @@ class StateStore:
                 _append_event(conn, now, "task", row["task_id"], None,
                               row["status"], Status.PENDING.value,
                               "force-reset via repair channel")
+        return len(rows)
+
+    def correct_document_doc_type(
+        self,
+        *,
+        country_code: str,
+        entity_ref: str,
+        doc_type: str,
+    ) -> int:
+        """Repair channel for the documents registry: re-derive one
+        entity's doc_type in place (audited like requeue/reset).
+
+        DEVIATION (2026-09-01, USA pack, batch E): documents rows are
+        INSERT OR IGNORE, so resetting the producing task can never heal a
+        mis-derived doc_type — re-registration is ignored on conflict. This
+        scoped UPDATE is the minimal sanctioned path; every call leaves an
+        event row (entity_type='documents')."""
+        now = utc_now_iso()
+        with self.transaction() as conn:
+            rows = conn.execute(
+                "SELECT doc_id, doc_type FROM documents "
+                "WHERE country_code = ? AND entity_ref = ?",
+                (country_code, entity_ref),
+            ).fetchall()
+            for row in rows:
+                conn.execute(
+                    "UPDATE documents SET doc_type = ? WHERE doc_id = ?",
+                    (doc_type, row["doc_id"]),
+                )
+                _append_event(conn, now, "documents", row["doc_id"], None,
+                              row["doc_type"], doc_type,
+                              "doc_type corrected via repair channel")
         return len(rows)
 
     def _select_tasks(self, *, task_type: str | None, task_id: str | None) -> list[sqlite3.Row]:

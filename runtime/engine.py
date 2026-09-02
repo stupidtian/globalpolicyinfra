@@ -48,10 +48,11 @@ class EngineReport:
     failed_permanent: int = 0
     escalated: int = 0
     empty_warned: int = 0
+    skipped_foreign: int = 0
     detail: dict[str, int] = field(default_factory=dict)
 
     def summary_lines(self) -> list[str]:
-        return [
+        lines = [
             f"seeds enqueued: {self.planned}",
             (
                 f"tasks done: {self.done} (retried {self.retried}, "
@@ -59,6 +60,11 @@ class EngineReport:
                 f"empty-warned {self.empty_warned})"
             ),
         ]
+        if self.skipped_foreign:
+            lines.append(
+                f"due tasks skipped (no handler in this source): {self.skipped_foreign}"
+            )
+        return lines
 
 
 class TaskEngine:
@@ -80,6 +86,7 @@ class TaskEngine:
         self.source = source
         self.transport = transport
         self.retry_policy = retry_policy or RetryPolicy()
+        self._warned_foreign: set[str] = set()
 
     # -- public entry points ----------------------------------------------------
 
@@ -110,15 +117,44 @@ class TaskEngine:
     # -- internals -----------------------------------------------------------------
 
     def _work(self, report: EngineReport) -> None:
+        own_types = set(self.source.task_types)
+        self._warn_foreign_due(own_types, report)
         while True:
-            due = self.store.iter_due_tasks()
+            due = self.store.iter_due_tasks(types=own_types)
             if not due:
-                return
+                break
             for task_id in due:
                 task = self.store.get_task(task_id)
                 if task is None:  # pragma: no cover - raced deletion
                     continue
                 self._execute(task, report)
+        # Second checkpoint: catches unknown types our own parse enqueued
+        # mid-run (still first-wins per type, so no repeat warnings).
+        self._warn_foreign_due(own_types, report)
+
+    def _warn_foreign_due(self, own_types: set[str], report: EngineReport) -> None:
+        """Visibility for due tasks this source cannot run (other sources'
+        leftovers or renamed types). The fetch layer already keeps them out
+        of the engine (ruling 2026-09-02); this reports what was held back:
+        one stderr warning and one audit note per type per run, tasks left
+        pending. The engine does not know who those tasks belong to, so the
+        wording must not claim it."""
+        for task_type, ids in sorted(self.store.foreign_due_tasks(own_types).items()):
+            if task_type in self._warned_foreign:
+                continue
+            self._warned_foreign.add(task_type)
+            print(
+                f"[warn] {len(ids)} due tasks of type {task_type!r} have no handler "
+                "in this source — left pending (other source or renamed type)",
+                file=sys.stderr,
+            )
+            self.store.note_event(
+                "engine",
+                f"foreign:{task_type}",
+                f"{len(ids)} due tasks have no handler in this source; left pending; "
+                f"examples: {', '.join(ids[:3])}",
+            )
+            report.skipped_foreign += len(ids)
 
     def _execute(self, task: dict[str, Any], report: EngineReport) -> None:
         task_id = task["task_id"]
@@ -130,12 +166,22 @@ class TaskEngine:
         )
         handler = self.source.task_types.get(view.type)
         if handler is None:
-            self.store.record_task_outcome(
-                task_id,
-                Status.FAILED_PERMANENT,
-                error=f"No handler registered for task type {view.type!r}",
+            # Second line of defense (ruling 2026-09-02): the fetch layer
+            # filters foreign types, so reaching here means a race between
+            # fetch and execute or a renamed type. Skip — never claim, never
+            # kill (2026-09-01 incident: 794 tasks lost to the old behavior).
+            print(
+                f"[warn] due task {task_id} of type {view.type!r} has no handler "
+                "in this source — left pending (other source or renamed type)",
+                file=sys.stderr,
             )
-            report.failed_permanent += 1
+            self._warned_foreign.add(view.type)
+            self.store.note_event(
+                "engine",
+                f"foreign:{view.type}",
+                f"task {task_id} skipped by the execution guard; left pending",
+            )
+            report.skipped_foreign += 1
             return
 
         attempt_number = task["attempts"] + 1
@@ -270,8 +316,16 @@ class TaskEngine:
             print(f"    [{seed.type}] {json.dumps(seed.params, ensure_ascii=False)}")
         if len(seeds) > 20:
             print(f"  … and {len(seeds) - shown} more")
-        due = self.store.iter_due_tasks()
-        print(f"  tasks already due in ledger: {len(due)}")
+        own_types = set(self.source.task_types)
+        due = self.store.iter_due_tasks(types=own_types)
+        print(f"  tasks already due in ledger (this source): {len(due)}")
+        # Operational check from the 2026-09-01 incident: before switching
+        # sources, confirm the other sources' queues are drained.
+        for task_type, ids in sorted(self.store.foreign_due_tasks(own_types).items()):
+            print(
+                f"  due tasks of type {task_type!r} (no handler in this source): "
+                f"{len(ids)} — left pending"
+            )
         return len(seeds)
 
 

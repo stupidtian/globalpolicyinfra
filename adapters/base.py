@@ -80,7 +80,12 @@ class RequestSpec:
     and the query-parameter slot it goes into — the key value itself never
     appears here. ``transport``: "http" today; "browser" with a
     ``browser_plan`` (a list of BROWSER_ACTIONS steps) once the browser
-    transport exists.
+    transport exists. ``accept_not_found``: declare that this request's
+    404/410 is *data, not an error* — the transport then hands the response
+    to the country's parse instead of raising PermanentError (date-addressed
+    APIs where "not found" legitimately means "nothing published that day",
+    e.g. the BOE daily summary; first adopted for ESP 2026-09-01). The
+    parser, not the framework, decides what the not-found response means.
     """
 
     url: str
@@ -90,6 +95,7 @@ class RequestSpec:
     key_param: str | None = None
     transport: str = "http"
     browser_plan: list[tuple[str, dict[str, Any]]] = field(default_factory=list)
+    accept_not_found: bool = False
 
 
 @dataclass(frozen=True)
@@ -112,7 +118,7 @@ class Response:
 @dataclass(frozen=True)
 class FileOut:
     """A file the country wants written, relative to the country root
-    (e.g. ``01_raw/policies/119/HR204/text/ih.xml``). Paths must land under
+    (e.g. ``01_raw/bills/119/HR204/text/ih.xml``). Paths must land under
     the country directory; the framework rejects escapes."""
 
     path: str

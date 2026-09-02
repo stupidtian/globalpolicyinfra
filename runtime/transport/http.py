@@ -86,6 +86,13 @@ class HttpTransport:
             if response.status_code == 200:
                 return Response(content=response.content, status_code=200)
             if response.status_code in (404, 410):
+                if spec.accept_not_found:
+                    # The source declared not-found as data (e.g. a
+                    # date-addressed API answering "nothing published that
+                    # day"); the country's parse decides what it means.
+                    return Response(
+                        content=response.content, status_code=response.status_code
+                    )
                 raise PermanentError(f"HTTP {response.status_code} for {url}")
             if response.status_code == 429 or response.status_code >= 500:
                 last_error = TransientError(

@@ -8,20 +8,21 @@ The layout follows the numbered-stage structure proven by the legacy
 ``path_resolver`` of ``global_policies``::
 
     {data_root}/{ISO3}_policy/
-    ├── 00_metadata/
-    │   └── policy_index.parquet      # analytical snapshot (spine: doc_id)
-    ├── 01_raw/
-    │   ├── html/  pdf/  xml/         # raw downloads by format
-    │   └── listings/                 # listing pages (promoted, not html-only)
-    ├── 02_cleaned/
-    │   ├── normalized_txt/           # format-normalized text
-    │   ├── body_only/                # body-extracted text
-    │   ├── chunked/{doc_id}/         # chunks, one directory per document
-    │   ├── classification/           # cleaning intermediate artifacts
-    │   └── reports/                  # exploration / cleaning reports
-    ├── 03_extracted/
-    │   ├── super_json/  goal_json/  merged/
-    └── state.db                      # per-country SQLite operational state
+    ├── 01_raw/                        # country-pack territory: one folder per
+    │                                   # policy (a bill, a decree); internal
+    │                                   # structure declared by the pack (§6.7)
+    ├── 02_cleaned/                     # document-pipeline territory; subdirs
+    │                                   # created on demand by the stages
+    ├── 03_extracted/                   # (same)
+    ├── failures/                       # incident archive (raw responses, meta)
+    ├── 00_metadata/                    # created on demand (export /
+    │                                   # events-archive write here)
+    └── state.db                        # per-country SQLite operational state
+
+``ensure_layout`` pre-creates only the framework-owned skeleton (01_raw
+itself, 02_cleaned, 03_extracted, failures) — 01_raw's top level belongs to
+source names, and nothing is pre-created inside the country pack's or the
+pipeline stages' territory (framework-hardening 1.4, 2026-09-02).
 
 Notes:
 - Reports live with the data (``02_cleaned/reports/``), not in git. This is a
@@ -29,6 +30,9 @@ Notes:
   revisit it.
 - Operational state moved from manifest JSON files to SQLite (decision record
   2026-08-19), so no manifest paths are defined here.
+- The ``raw_dir``/``listings_dir`` helpers below are legacy path formulas
+  from the pre-2026-08-24 layout; they no longer correspond to directories
+  the framework creates.
 """
 
 from __future__ import annotations
@@ -123,13 +127,13 @@ def state_db_path(data_root: str | Path, country_code: str) -> Path:
 
 
 def ensure_layout(data_root: str | Path, country_code: str) -> None:
-    """Create the full standard directory tree for a country (idempotent)."""
-    dirs = [
-        metadata_dir(data_root, country_code),
-        *[raw_dir(data_root, country_code, fmt) for fmt in RAW_FORMATS],
-        listings_dir(data_root, country_code),
-        *[cleaned_dir(data_root, country_code, sub) for sub in CLEANED_SUBDIRS],
-        *[extracted_dir(data_root, country_code, sub) for sub in EXTRACTED_SUBDIRS],
-    ]
-    for path in dirs:
-        path.mkdir(parents=True, exist_ok=True)
+    """Create the framework-owned directory skeleton for one country
+    (idempotent): the country root plus exactly ``01_raw/``,
+    ``02_cleaned/``, ``03_extracted/`` and ``failures/`` — nothing else.
+    ``01_raw``'s top level belongs to source names (section 6.7), pipeline
+    subdirs are created on demand by their stages, ``00_metadata`` is
+    created by its writers, and ``state.db`` by the store
+    (framework-hardening 1.4, ruling 2026-09-02)."""
+    root = country_dir(data_root, country_code)
+    for name in ("01_raw", "02_cleaned", "03_extracted", "failures"):
+        (root / name).mkdir(parents=True, exist_ok=True)
