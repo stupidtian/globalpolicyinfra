@@ -35,7 +35,7 @@
 | `bill_list_page` | GET `/bill/119?offset=N&limit=250` | 台账行（每法案一条）+ 下一页任务 + 符合条件的深抓任务 |
 | `bill_detail` | GET `/bill/119/{type}/{number}` | 台账补全（发起人/政策领域/文件夹） |
 | `bill_actions` | GET `.../actions` | 生命周期大事记（整表重写）+ 终局判定 |
-| `bill_summaries` | GET `.../summaries` | CRS 官方摘要全文 |
+| `bill_summaries` | GET `.../summaries` | 国会研究处（Congressional Research Service，CRS）官方摘要全文 |
 | `bill_text` | GET `.../text` | 登记各版本文档 + 每版本一个下载任务 |
 | `bill_text_dl` | GET 版本文件 URL（congress.gov） | 法案文本 XML/HTML 落盘 |
 | `vote_list_page` | GET `/house-vote/119/{session}?offset=N` | 投票行 + 下一页 + 详情任务 |
@@ -64,12 +64,12 @@ sync=1                  增量：只枚举自上次游标后有更新的法案
 | `bill_actions` 表 | 大事记：日期、类型码、原文、涉及委员会编号（每法案整表重写） |
 | `votes` 表 | 投票头：议题、结果、日期、所投法案（bill_id 回链）、政党汇总（如 R 208-0） |
 | `documents` 表 | 法案文本版本：一版一档，`entity_ref` 指回法案（如 `bills:USA_119_S_98`） |
-| `01_raw/policies/{届}/{类型}{号}/` | 该法案的全部材料（人读镜像，路径入账） |
+| `01_raw/bills/{届}/{类型}{号}/` | 该法案的全部材料（人读镜像，路径入账） |
 
 文件夹布局（真实示例，S 98）：
 
 ```
-01_raw/policies/119/S98/
+01_raw/bills/119/S98/
 ├── detail.json          ← 详情页原始响应
 ├── actions.json         ← 动作页原始响应
 ├── summaries.json       ← 摘要页原始响应
@@ -149,4 +149,4 @@ python cli.py requeue --country usa        # 失败任务复位
 
 ---
 
-*更新日期：2026-08-30（规范翻新，内容未动）；数据快照：2026-08-27；数据由 119 届全量基线（18,417 法案、74 页枚举链零失败）与窗口深抓案例背书。*
+*更新日期：2026-09-01（目录路径迁移 bills/，内容未动；上次规范翻新 2026-08-30）；数据快照：2026-08-27；数据由 119 届全量基线（18,417 法案、74 页枚举链零失败）与窗口深抓案例背书。*

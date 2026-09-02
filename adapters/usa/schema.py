@@ -27,6 +27,18 @@ regulations source (v2) — one RIN is the spine of a rulemaking's life:
   reviewed once per draft: proposed, then final).
 - ``source_snapshots`` — accounting for the raw agenda/OIRA XML files kept
   under 01_raw/regulations/ (every path must be in the ledger, §6.7).
+
+guidance source (v3) — agency-direct policy documents (the layer that is
+neither legislation nor FR rulemaking):
+
+- ``guidance_documents`` — one row per document, keyed (agency, native_id)
+  where native_id is the agency's own stable identifier (IRB document
+  number, FAQ number, bulletin number, series number; URL-hash when the
+  source has none). ``native_type`` keeps the source's own type string
+  verbatim (re-tagging = re-derivation, never a refetch); ``doc_type``
+  draws from the controlled vocabulary under tagging rules R1-R5;
+  ``page_class`` (EPA-style sitemap classification) stays separate from
+  doc_type by rule R5.
 """
 
 from __future__ import annotations
@@ -46,7 +58,7 @@ __all__ = [
     "yn_flag",
 ]
 
-SCHEMA_VERSION = "2"
+SCHEMA_VERSION = "4"
 
 DOMAIN_SCHEMA = f"""
 -- usa domain ledger, schema version {SCHEMA_VERSION} (additive migrations only)
@@ -182,6 +194,26 @@ CREATE TABLE IF NOT EXISTS oira_reviews (
     PRIMARY KEY (rin, date_received, stage)
 );
 
+CREATE TABLE IF NOT EXISTS guidance_documents (
+    agency TEXT NOT NULL,
+    native_id TEXT NOT NULL,
+    department TEXT,
+    channel TEXT,
+    native_type TEXT,
+    doc_type TEXT,
+    title TEXT,
+    issued_date TEXT,
+    revised_date TEXT,
+    product_area TEXT,
+    status TEXT,
+    url TEXT,
+    file_url TEXT,
+    folder TEXT,
+    page_class TEXT,
+    text_extracted TEXT,
+    PRIMARY KEY (agency, native_id)
+);
+
 CREATE TABLE IF NOT EXISTS source_snapshots (
     source TEXT NOT NULL,
     edition TEXT NOT NULL,
@@ -201,6 +233,7 @@ DOMAIN_TABLES: tuple[str, ...] = (
     "ua_entries",
     "oira_reviews",
     "source_snapshots",
+    "guidance_documents",
 )
 
 #: Primary keys for the ledger's merge writes (UPDATE-first, section 6.2):
@@ -215,6 +248,7 @@ DOMAIN_KEYS: dict[str, tuple[str, ...]] = {
     "ua_entries": ("rin", "edition_id"),
     "oira_reviews": ("rin", "date_received", "stage"),
     "source_snapshots": ("source", "edition"),
+    "guidance_documents": ("agency", "native_id"),
 }
 
 
@@ -228,28 +262,37 @@ def bill_identity(congress: int, bill_type: str, number: str | int) -> tuple[str
 def bill_folder(congress: int, bill_type: str, number: str | int) -> str:
     """Per-policy folder (relative to the country root, §6.7): one folder
     per bill, sharded by congress so a single directory never holds
-    hundreds of thousands of entries."""
+    hundreds of thousands of entries. Top level is the source name
+    (``01_raw/bills/``), per the 2026-09-01 layout spec."""
     _, type_upper, number_str = bill_identity(congress, bill_type, number)
-    return f"01_raw/policies/{int(congress)}/{type_upper.upper()}{number_str}"
+    return f"01_raw/bills/{int(congress)}/{type_upper.upper()}{number_str}"
 
 
 def fr_folder(publication_date: str, document_number: str) -> str:
     """Per-policy folder for a Federal Register document: one folder per
     document, sharded by publication year (a modern year publishes ~28k
-    documents)."""
+    documents), under the regulations source root (layout spec 2026-09-01)."""
     year = str(publication_date or "")[:4] or "undated"
-    return f"01_raw/policies/fr/{year}/{document_number}"
+    return f"01_raw/regulations/fr/{year}/{document_number}"
 
 
-def fr_doc_type(fr_type: str | None, subtype: str | None = None) -> str:
+def fr_doc_type(
+    fr_type: str | None,
+    subtype: str | None = None,
+    executive_order_number: str | int | None = None,
+) -> str:
     """Map a Federal Register type to the cross-country doc_type vocabulary
     (soft per §5.1; the original type/subtype always travel in
-    raw_metadata)."""
+    raw_metadata). Only a native executive_order_number makes a presidential
+    document an EXECUTIVE_ORDER — proclamations, determinations and
+    memoranda are PRESIDENTIAL_DOCUMENT (rule R1: never guess)."""
     kind = (fr_type or "").strip()
     if kind in ("Rule", "Proposed Rule"):
         return "REGULATION"
     if kind == "Presidential Document":
-        return "EXECUTIVE_ORDER"
+        if str(executive_order_number or "").strip():
+            return "EXECUTIVE_ORDER"
+        return "PRESIDENTIAL_DOCUMENT"
     return "OTHER"
 
 

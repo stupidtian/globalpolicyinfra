@@ -65,12 +65,12 @@ sync=1                  incremental: enumerate only bills updated since the last
 | `bill_actions` table | History: date, action code, original text, committee codes involved (rewritten whole per bill) |
 | `votes` table | Vote headers: question, result, date, the bill voted on (bill_id backlink), party totals (e.g. R 208-0) |
 | `documents` table | Bill text versions: one row per version, `entity_ref` pointing back to the bill (e.g. `bills:USA_119_S_98`) |
-| `01_raw/policies/{congress}/{TYPE}{number}/` | All material of that bill (human-readable mirror; every path is accounted for in the ledger) |
+| `01_raw/bills/{congress}/{TYPE}{number}/` | All material of that bill (human-readable mirror; every path is accounted for in the ledger) |
 
 Folder layout (real example, S 98):
 
 ```
-01_raw/policies/119/S98/
+01_raw/bills/119/S98/
 ├── detail.json          ← raw detail-endpoint response
 ├── actions.json         ← raw actions-endpoint response
 ├── summaries.json       ← raw summaries-endpoint response
@@ -150,4 +150,4 @@ python cli.py requeue --country usa        # un-fail failed tasks
 
 ---
 
-*Last updated: 2026-08-27*
+*Last updated: 2026-09-01 (layout paths migrated; content unchanged since 2026-08-27)*

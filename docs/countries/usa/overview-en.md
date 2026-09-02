@@ -21,6 +21,7 @@ The two sources run independently (`--source bills` / `--source regulations`) an
 | API keys | Only bills needs one: put `CONGRESS_API_KEY=…` in `.env` (see section 2 of usa-bills.md). regulations needs no key at all |
 | Common commands | `collect` (key=value params) / `status` / `export` / `requeue` / `reset` — all run from the repository root as `python cli.py …` |
 | Pacing | The framework throttles uniformly (0.5–1 s random delay between requests) with triage-based retries; hitting a rate limit just slows things down, no data is lost |
+| **Run one source at a time** | The country ledger hands out tasks by due time, while task handlers are registered per source — **before switching `--source`, confirm the previous source's queue is drained** (check the non-done task count with `python cli.py status`). Otherwise the other source's pending tasks are misjudged as handler-less permanent failures (fully recoverable via `requeue`, but best avoided) |
 
 ## 3. Policy Layers Not Yet Covered
 

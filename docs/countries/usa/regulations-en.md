@@ -106,16 +106,15 @@ One key difference from bills: **an FR document barely changes once published** 
 File locations (two kinds):
 
 ```
-01_raw/
-├── policies/fr/{year}/{docnum}/         ← one folder per FR document (year-sharded against bloat)
-│   ├── detail.json                      ← detail-endpoint mirror (for human inspection)
-│   └── text/{raw.txt, full.xml}         ← the text in two formats
-└── regulations/
-    ├── agenda/{edition}.xml             ← 60 raw agenda snapshots (no re-download to re-parse; several hundred MB for full history)
-    └── oira/{year}.xml                  ← 46+ raw review snapshots
+01_raw/regulations/
+├── fr/{year}/{docnum}/         ← one folder per FR document (year-sharded against bloat)
+│   ├── detail.json             ← detail-endpoint mirror (for human inspection)
+│   └── text/{raw.txt, full.xml}  ← the text in two formats
+├── agenda/{edition}.xml        ← 60 agenda bulk files (no re-download to re-parse; several hundred MB for full history)
+└── oira/{year}.xml             ← 46+ review bulk files
 ```
 
-Agenda/review snapshots are not "one policy's material" and do not go under policies/; their paths are accounted for in `source_snapshots`.
+The three top folders `bills/ regulations/ guidance/` map one-to-one to the three `--source` values (layout spec 2026-09-01). Agenda/review bulk files are not "one policy's material" and do not go under fr/; their paths are accounted for in `source_snapshots`.
 
 ## 5. Full Case Walkthroughs (two real rules, as recorded in the ledger)
 
@@ -208,4 +207,4 @@ python cli.py requeue --country usa
 
 ---
 
-*Last updated: 2026-08-27*
+*Last updated: 2026-09-01 (layout paths migrated; content unchanged since 2026-08-27)*

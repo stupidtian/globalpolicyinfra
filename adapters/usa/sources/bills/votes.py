@@ -149,7 +149,7 @@ class VoteDetailHandler:
         if isinstance(bill_ref, str) and bill_ref:
             # mirror into the voted-on bill's folder (human projection)
             parts = bill_ref.split("_", 3)
-            folder = f"01_raw/policies/{parts[1]}/{parts[2]}{parts[3]}"
+            folder = f"01_raw/bills/{parts[1]}/{parts[2]}{parts[3]}"
             files.append(FileOut(path=f"{folder}/votes/{row['vote_id']}.json",
                                  content=response.content))
         return TaskResult(upsert_rows={"votes": [row]}, files=files)

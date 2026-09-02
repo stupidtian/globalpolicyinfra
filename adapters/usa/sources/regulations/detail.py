@@ -126,7 +126,7 @@ class FrDetailHandler:
                     source_url=url,
                     publication_date=publication_date or None,
                     issuing_authority=lead_agency or "Federal Register",
-                    doc_type=fr_doc_type(fr_type, fr_subtype),
+                    doc_type=fr_doc_type(fr_type, fr_subtype, doc.get("executive_order_number")),
                     entity_ref=f"fr_documents:{document_number}",
                     language="en",
                     raw_metadata={
