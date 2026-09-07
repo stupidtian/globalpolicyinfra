@@ -125,7 +125,10 @@ def start_tasks(params: dict[str, Any]) -> list[TaskSeed]:
     except ValueError:
         raise _fail(f"year must be a number (got {year_raw!r})") from None
     if not FIRST_YEAR <= year <= LAST_YEAR:
-        raise _fail(f"year {year} is outside the archive coverage {FIRST_YEAR}-{LAST_YEAR}")
+        raise _fail(
+            f"year {year} is outside the archive coverage {FIRST_YEAR}-{LAST_YEAR}; "
+            f"for 2023 onwards use --source ebgbl (see docs/countries/deu/ebgbl-zh.md)"
+        )
 
     issues = _parse_issues(str(params.get("issues", "all")))
 
