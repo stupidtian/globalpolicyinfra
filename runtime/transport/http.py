@@ -1,7 +1,8 @@
 """HTTP transport: throttle, seconds-scale retries, key injection.
 
 Boundary (decision record 2026-08-20): this layer absorbs single-request
-jitter (connection resets, 429, 5xx, timeouts) with short exponential
+jitter (connection resets, 429, 5xx, timeouts, WAF-challenge and temporary-ban
+status codes 202/437/438 observed on government sites) with short exponential
 backoff; once its budget is spent it raises :class:`TransientError` and the
 engine decides when the task is retried.
 
@@ -94,7 +95,12 @@ class HttpTransport:
                         content=response.content, status_code=response.status_code
                     )
                 raise PermanentError(f"HTTP {response.status_code} for {url}")
-            if response.status_code == 429 or response.status_code >= 500:
+            if response.status_code in (202, 429, 437, 438) or response.status_code >= 500:
+                # 429/5xx: classic overload. 202/437/438 are site-state, not
+                # task truth (observed on legislation.gov.uk, 2026-09): 202 with
+                # ``x-amzn-waf-action: challenge`` is an AWS WAF fingerprint
+                # challenge; 437/438 are app-level temporary ban / rate cap.
+                # All can lift on their own, so they retry like any transient.
                 last_error = TransientError(
                     f"HTTP {response.status_code} for {url} (attempt {attempt})"
                 )
