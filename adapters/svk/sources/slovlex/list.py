@@ -13,7 +13,12 @@ Response shape (probed 2026-09-08)::
 ``ucinnyDo`` appears only when the version's validity ends (repealed or
 sunset laws). ``zodpovedajucaUcinnost`` is a server-time echo (today for
 in-force laws, the validity end for dead ones) and deliberately never
-enters task params — it would corrode task identity day by day.
+enters task params — it would corrode task identity day by day. The
+listing ``iri`` itself is only a pointer: its trailing segment is a dated
+version for amended laws (drifting) or the as-declared alias for others
+(both shapes probed in production, 2026-09-15) — capture always targets
+the alias, so entries are validated for shape but normalized to
+``vyhlasene_znenie`` regardless of what the listing points at.
 
 The walk (vyhlaseny-descending, no server-side date filter exists):
 entries newer than the window's ``to`` are skipped and the page chains
@@ -22,21 +27,33 @@ too (sort is verified non-increasing on every page); a short page is the
 corpus tail. Either terminal confirms the window fully consumed and
 advances the cursor. ``max_docs`` caps the spawns and, when it bites,
 stops the walk — a trial window, not a partial crawl — and withholds the
-cursor (the window was not fully consumed).
+cursor (the window was not fully consumed). Out-of-window rows are not
+validated beyond their date: a malformed field on a skipped entry is a
+non-event, while any anomaly on an in-window entry escalates loudly.
 """
 
 from __future__ import annotations
 
+import re as re_mod
 from typing import Any
 
 from adapters.base import RequestSpec, Response, TaskResult, TaskSeed, TaskView
-from adapters.svk.sources.slovlex import API_URL, CURSOR_KEY, PAGE_SIZE, iri_parts, list_params
+from adapters.svk.sources.slovlex import (
+    API_URL,
+    CURSOR_KEY,
+    PAGE_SIZE,
+    alias_iri,
+    iri_parts,
+    list_params,
+)
 
 __all__ = ["SvkListHandler", "doc_seed", "iso_day"]
 
-#: Fields every doc must carry (probed shape); their absence is a listing
-#: shape change, not a data boundary.
-_REQUIRED = ("iri", "vyhlaseny", "typPredp", "typPredp_value", "rocnik", "nazov", "cislo")
+#: Fields every in-window doc must carry (probed shape); their absence is
+#: a listing shape change, not a data boundary. ``typPredp`` (machine name)
+#: is deliberately absent: some rows carry only the Slovak word, which the
+#: doc-type mapping also accepts (probed 2026-09-16).
+_REQUIRED = ("iri", "vyhlaseny", "typPredp_value", "rocnik", "nazov", "cislo")
 
 
 def iso_day(value: str) -> str:
@@ -48,32 +65,42 @@ def iso_day(value: str) -> str:
     return day
 
 
-def doc_seed(doc: dict[str, Any]) -> TaskSeed:
-    """Validate one listing row and build its svk_pdf seed.
+def doc_seed(doc: dict[str, Any], capture_pdf: bool = True,
+             versions: bool = False) -> TaskSeed:
+    """Validate one in-window listing row and build its spawn.
 
-    Params are the stable fields only (publication date, number, type,
-    title, validity window of the pointed version) — enough for the doc
-    task to cross-check the page against the listing.
+    The capture iri is ALWAYS the as-declared alias (stable, idempotent);
+    the listing's own pointer is parsed for its law coordinates and then
+    normalized away. Params are otherwise the stable fields only — enough
+    for the doc task to cross-check the page against the listing. The
+    pdf/versions sweep flags ride the list task's identity; versions also
+    marks the doc spawn so version-fetching sweeps keep their own task
+    identity (done event docs are not re-opened by them).
     """
     for field in _REQUIRED:
         value = doc.get(field)
         if not isinstance(value, str) or not value.strip():
             raise ValueError(f"listing doc misses {field!r}: {doc!r}")
-    iri = doc["iri"]
-    iri_parts(iri)  # shape guard: /SK/ZZ/{year}/{no}/{yyyymmdd}
+    rocnik, number, _ver = iri_parts(doc["iri"].strip())
+    machine = doc.get("typPredp")
     params: dict[str, Any] = {
-        "iri": iri,
+        "iri": alias_iri(rocnik, number),
         "vyhlaseny": iso_day(doc["vyhlaseny"]),
-        "cislo": doc["cislo"].strip(),
-        "typ_predp": doc["typPredp"].strip(),
+        "cislo": re_mod.sub(r"[\s ]+", " ", doc["cislo"]).strip(),
         "typ_predp_value": doc["typPredp_value"].strip(),
         "nazov": doc["nazov"].strip(),
     }
+    if isinstance(machine, str) and machine.strip():
+        params["typ_predp"] = machine.strip()
+    if versions:
+        params["versions"] = 1
     for source, target in (("ucinnyOd", "ucinny_od"), ("ucinnyDo", "ucinny_do")):
         value = doc.get(source)
         if isinstance(value, str) and value.strip():
             params[target] = iso_day(value)
-    return TaskSeed(type="svk_pdf", params=params)
+    if capture_pdf:
+        return TaskSeed(type="svk_pdf", params=params)
+    return TaskSeed(type="svk_doc", params={**params, "pdf_ok": 0})
 
 
 class SvkListHandler:
@@ -102,14 +129,20 @@ class SvkListHandler:
         capped = False
         crossed = False
         previous = ""
+        capture_pdf = params.get("pdf", 1) != 0
+        capture_versions = params.get("versions") == 1
         for doc in docs:
             if not isinstance(doc, dict):
                 # Shape change, same convention as the docs-array guard.
                 raise ValueError(  # noqa: TRY004
                     f"listing page at start={start} holds a non-object doc"
                 )
-            seed = doc_seed(doc)
-            day = str(seed.params["vyhlaseny"])
+            vyhlaseny = doc.get("vyhlaseny")
+            if not isinstance(vyhlaseny, str) or not vyhlaseny.strip():
+                raise ValueError(
+                    f"listing page at start={start} holds a doc without vyhlaseny"
+                )
+            day = iso_day(vyhlaseny)
             if previous and day > previous:
                 raise ValueError(
                     f"listing page at start={start} is not vyhlaseny-descending "
@@ -124,7 +157,7 @@ class SvkListHandler:
             if cap is not None and len(seeds) >= int(cap):
                 capped = True
                 break
-            seeds.append(seed)
+            seeds.append(doc_seed(doc, capture_pdf, capture_versions))
 
         next_tasks: list[TaskSeed] = list(seeds)
         cursor_updates: dict[str, str] = {}

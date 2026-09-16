@@ -17,7 +17,7 @@ document; any other failure escalates.
 from __future__ import annotations
 
 from adapters.base import FileOut, RequestSpec, Response, TaskResult, TaskSeed, TaskView
-from adapters.svk.sources.slovlex import canonical_pdf_url, iri_parts
+from adapters.svk.sources.slovlex import canonical_pdf_url, iri_parts, number_segment
 
 __all__ = ["SvkPdfHandler", "pdf_path"]
 
@@ -25,7 +25,8 @@ __all__ = ["SvkPdfHandler", "pdf_path"]
 def pdf_path(iri: str) -> str:
     """Raw-folder path of the PDF below the country root."""
     rocnik, number, ver = iri_parts(iri)
-    return f"01_raw/slovlex/{rocnik}/{int(number):03d}/{rocnik}_{int(number):03d}_{ver}.pdf"
+    seg = number_segment(number)
+    return f"01_raw/slovlex/{rocnik}/{seg}/{rocnik}_{seg}_{ver}.pdf"
 
 
 class SvkPdfHandler:

@@ -9,8 +9,12 @@ instruments), then the full text. The response carries no charset header
 crawl lost every Slovak diacritic by trusting HTTP-client guessing).
 
 The listing row rides in task params and is cross-checked against the
-page (number, publication date, type): a mismatch means the page template
-or the listing shape changed — escalated loudly, never silently absorbed.
+page (number, type): a mismatch there means the page template or the
+listing shape changed — escalated loudly, never silently absorbed. The
+publication DATE is page-authoritative: for dead instruments the listing
+regenerates its row with the end date in every field (probed 2026-09-15,
+201/2022 Z. z. — that row is the instrument's only index entry), so a
+date mismatch records the listing value in meta and trusts the page.
 Template drift observed between 2026-07 and 2026-09 (a "čiastka" row
 appeared) is why the parser reads the table generically: known labels map
 to meta keys, unknown labels are ignored, absent optional labels are
@@ -22,18 +26,26 @@ from __future__ import annotations
 import html as html_mod
 import re
 
-from adapters.base import FileOut, RequestSpec, Response, TaskResult, TaskView
+from adapters.base import FileOut, RequestSpec, Response, TaskResult, TaskSeed, TaskView
 from adapters.svk.sources.slovlex import (
+    ALIAS_VER,
     canonical_html_url,
     canonical_pdf_url,
     iri_parts,
     map_doc_type,
+    number_segment,
     sk_date_to_iso,
 )
 from adapters.svk.sources.slovlex.pdf import pdf_path
 from core.document import DocumentRecord, compute_doc_id
 
-__all__ = ["SvkDocHandler", "html_path", "parse_info_table", "parse_relations"]
+__all__ = [
+    "SvkDocHandler",
+    "html_path",
+    "parse_historia",
+    "parse_info_table",
+    "parse_relations",
+]
 
 _INFO_TABLE_RE = re.compile(r'<table id="InfoTable">(.*?)</table>', re.DOTALL)
 _ROW_RE = re.compile(
@@ -49,6 +61,16 @@ _RELATION_RE = re.compile(
 _RELATION_REF_RE = re.compile(
     r'<td class="infoTable-nadpis">(.*?)</td>', re.DOTALL
 )
+
+#: The embedded "História" table (probed 2026-09-15, present on every page
+#: of an instrument, including the as-declared alias): one row per version
+#: with its stable iri, whether it is the declared text, its validity
+#: window and the amending law's cell — the complete version list of an
+#: instrument, zero extra requests.
+_HIST_ROW_RE = re.compile(
+    r'<tr class="effectivenessHistoryItem"(.*?)</tr>', re.DOTALL
+)
+_HIST_ATTR_RE = re.compile(r'data-(iri|vyhlasene|ucinnostod|ucinnostdo)="([^"]*)"')
 
 
 def _cell_text(fragment: str) -> str:
@@ -90,10 +112,45 @@ def parse_relations(page: str) -> str:
     return " | ".join(sections)
 
 
+def parse_historia(page: str) -> list[dict[str, str]]:
+    """The embedded version history: one dict per "História" row.
+
+    Keys: iri (full /SK/ZZ/… form), vyhlasene ("1" on the declared-text
+    row), ucinnostod/ucinnostdo (ISO dates or empty), novela (the
+    amending-law cell, tag-free). Row order is the source's own.
+    """
+    rows: list[dict[str, str]] = []
+    for row_html in _HIST_ROW_RE.findall(page):
+        attrs = dict(_HIST_ATTR_RE.findall(row_html))
+        if "iri" not in attrs:
+            continue
+        cells = re.findall(r"<td[^>]*>(.*?)</td>", row_html, re.DOTALL)
+        novela = _cell_text(cells[-1]) if len(cells) >= 3 else ""
+        rows.append({
+            "iri": attrs["iri"],
+            "vyhlasene": attrs.get("vyhlasene", ""),
+            "ucinnostod": attrs.get("ucinnostod", ""),
+            "ucinnostdo": attrs.get("ucinnostdo", ""),
+            "novela": novela,
+        })
+    return rows
+
+
+def _historia_meta(rows: list[dict[str, str]]) -> str:
+    """'ver|od|do|novela' per version, ';'-joined — the timeline in meta."""
+    parts = []
+    for row in rows:
+        _, _number, ver = iri_parts(row["iri"])
+        label = ALIAS_VER if row["vyhlasene"] == "1" else ver
+        parts.append(f"{label}|{row['ucinnostod']}|{row['ucinnostdo']}|{row['novela']}")
+    return ";".join(parts)
+
+
 def html_path(iri: str) -> str:
     """Raw-folder path of the HTML main file below the country root."""
     rocnik, number, ver = iri_parts(iri)
-    return f"01_raw/slovlex/{rocnik}/{int(number):03d}/{rocnik}_{int(number):03d}_{ver}.html"
+    seg = number_segment(number)
+    return f"01_raw/slovlex/{rocnik}/{seg}/{rocnik}_{seg}_{ver}.html"
 
 
 def _require(info: dict[str, str], label: str, iri: str) -> str:
@@ -127,10 +184,14 @@ class SvkDocHandler:
         if page_declared is None:
             raise ValueError(f"page of {iri} has an unparsable Dátum vyhlásenia")
         if page_declared != str(params["vyhlaseny"]):
-            raise ValueError(
-                f"page of {iri} declares {page_declared}, listing said "
-                f"{params['vyhlaseny']!r}"
-            )
+            # Probed in production (2026-09-15, 201/2022 Z. z.): the listing
+            # regenerates dead instruments' rows with their END date in every
+            # date field — the row is the instrument's only index entry, so
+            # dropping it would lose the law. The page is the native truth:
+            # its declaration date wins, the listing value is kept in meta.
+            listing_date = str(params["vyhlaseny"])
+        else:
+            listing_date = ""
         page_typ = _require(info, "Typ", iri)
         if page_typ != str(params["typ_predp_value"]):
             raise ValueError(
@@ -140,10 +201,9 @@ class SvkDocHandler:
         title = _require(info, "Názov", iri)
 
         rocnik, _number, ver = iri_parts(iri)
-        publication_date = str(params["vyhlaseny"])
-
+        publication_date = page_declared
+        machine_type = params.get("typ_predp")
         meta: dict[str, str] = {
-            "typ_predp": str(params["typ_predp"]),
             "typ_predp_value": str(params["typ_predp_value"]),
             "cislo": str(params["cislo"]),
             "rocnik": rocnik,
@@ -151,6 +211,10 @@ class SvkDocHandler:
             "datum_vyhlasenia": page_declared,
             "pdf_url": canonical_pdf_url(iri),
         }
+        if machine_type is not None:
+            meta["typ_predp"] = str(machine_type)
+        if listing_date:
+            meta["vyhlaseny_listing"] = listing_date  # regenerated row, see above
         for param_key in ("ucinny_od", "ucinny_do"):
             value = params.get(param_key)
             if value is not None:
@@ -174,16 +238,38 @@ class SvkDocHandler:
         relations = parse_relations(page)
         if relations:
             meta["vztahy"] = relations
+        historia = parse_historia(page)
+        if historia:
+            meta["historia"] = _historia_meta(historia)
         if int(params.get("pdf_ok", 0)):
             # Written by the svk_pdf task that spawned this one.
             meta["files"] = pdf_path(iri)
+
+        # Version channel (versions=1 sweeps): fetch every dated version
+        # the História table offers. The declared text is this very page —
+        # not re-spawned; spawned tasks drop the versions flag (their own
+        # História is redundant), so the spawn graph cannot recurse.
+        next_tasks: list[TaskSeed] = []
+        if params.get("versions"):
+            for row in historia:
+                if row["vyhlasene"] == "1":
+                    continue
+                spawn_params = {
+                    key: value for key, value in params.items() if key != "versions"
+                }
+                spawn_params["iri"] = row["iri"]
+                spawn_params["pdf_ok"] = 0
+                next_tasks.append(TaskSeed(type="svk_doc", params=spawn_params))
 
         record = DocumentRecord(
             title=title,
             source_url=canonical_html_url(iri),
             publication_date=publication_date,
             issuing_authority=autor or None,
-            doc_type=map_doc_type(str(params["typ_predp"])),
+            doc_type=map_doc_type(
+                str(machine_type) if machine_type is not None else None,
+                str(params["typ_predp_value"]),
+            ),
             language="slk",
             raw_metadata=meta,
         )
@@ -191,4 +277,5 @@ class SvkDocHandler:
         return TaskResult(
             documents=[record],
             files=[FileOut(path=html_path(iri), content=response.content, doc_id=doc_id)],
+            next_tasks=next_tasks,
         )

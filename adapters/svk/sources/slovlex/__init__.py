@@ -7,13 +7,16 @@ IS the official gazette: free, same legal force as paper, numbered
 per year, declared with a publication date. Corpus 1918–2026, 26,562
 entries (probed 2026-09-08).
 
-Capture policy (as-declared snapshots, plan Q1 ruling 2026-09-08): the
-document is the text a publication event produced. For freshly declared
-instruments the listing's ``iri`` is exactly that original text; the
-listing pointer drifts to the newest consolidated version only for
-already-amended old laws, where a re-crawl honestly snapshots what the
-source serves at discovery time. Consolidation history (konsolidované
-znenia) is a deferred channel.
+Capture policy (as-declared originals, plan Q1 ruling 2026-09-08,
+sharpened 2026-09-15): the document is the text a publication event
+produced — captured via the stable alias ``/SK/ZZ/{y}/{n}/vyhlasene_znenie``
+(Vyhlásené znenie, the as-declared text; probed to exist on every
+instrument and byte-identical to the dated original). The listing's own
+pointer drifts to the newest consolidated version for amended laws and is
+deliberately NOT followed for capture — only its effect-status fields
+(ucinnyOd/ucinnyDo) ride into meta. Version history (konsolidované
+znenia) is reachable as dated pages chained by their validity windows
+(see the version-channel notes in the task folder).
 
 Channels (probed 2026-09-08, no key / no session / no csrf / robots open):
 
@@ -49,8 +52,11 @@ svk_pdf          one instrument's official PDF; 200 stores the file and
                  document, the missing PDF is recorded, not faked
 svk_doc          one instrument's HTML page; cross-checks the listing row
                  (cislo / vyhlaseny / typ) against the page, parses the
-                 InfoTable + relation tables, emits the document + main
-                 file (+ meta.files pointing at the already-written PDF)
+                 InfoTable + relation tables + the embedded História
+                 version list, emits the document + main file (+ meta.files
+                 pointing at the already-written PDF); with versions=1 it
+                 also spawns one svk_doc per dated version (no recursion:
+                 spawns drop the flag)
 ===============  =====================================================
 
 Params (key=value on the CLI)::
@@ -61,21 +67,28 @@ Params (key=value on the CLI)::
                                     day's issues fill in during the day)
     max_docs=200                    cap on document spawns (stops the walk
                                     too: a trial window, not a partial crawl)
+    versions=1                      additionally fetch every dated version
+                                    from each page's embedded História
+                                    table (default 0: events only — the
+                                    timeline itself lands in meta either way)
 """
 
 from __future__ import annotations
 
+import re
 from datetime import UTC, date, datetime, timedelta
 from typing import Any
 
 from adapters.base import SourceDefinition, TaskSeed
 
 __all__ = [
+    "ALIAS_VER",
     "API_URL",
     "CURSOR_KEY",
     "PAGE_SIZE",
     "PDF_BASE",
     "STATIC_BASE",
+    "alias_iri",
     "build_slovlex",
     "canonical_html_url",
     "canonical_pdf_url",
@@ -106,9 +119,25 @@ _DOC_TYPES = {
     # Uznesenie (government resolution) crosses classes — left as OTHER.
 }
 
+#: Same mapping keyed by the Slovak word — some listing rows carry only
+#: typPredp_value without the machine name (probed 2026-09-16, /SK/ZZ/2016/87).
+_DOC_TYPES_BY_WORD = {
+    word: _DOC_TYPES[machine]
+    for machine, word in (
+        ("Zakon", "Zákon"),
+        ("NariadenieVlady", "Nariadenie vlády"),
+        ("Vyhlaska", "Vyhláška"),
+        ("Opatrenie", "Opatrenie"),
+        ("Oznamenie", "Oznámenie"),
+        ("Rozhodnutie", "Rozhodnutie"),
+    )
+}
 
-def map_doc_type(typ_predp: str) -> str:
-    return _DOC_TYPES.get(typ_predp.strip(), "OTHER")
+
+def map_doc_type(typ_predp: str | None, typ_value: str = "") -> str:
+    if typ_predp:
+        return _DOC_TYPES.get(typ_predp.strip(), "OTHER")
+    return _DOC_TYPES_BY_WORD.get(typ_value.strip(), "OTHER")
 
 
 def list_params(start: int) -> dict[str, str]:
@@ -121,15 +150,49 @@ def list_params(start: int) -> dict[str, str]:
     return {"rows": str(PAGE_SIZE), "start": str(start), "sort": "vyhlaseny desc"}
 
 
+#: Trailing iri segment forms (probed 2026-09-15): a version's effective
+#: date (yyyymmdd), or the stable alias ``vyhlasene_znenie`` — the
+#: as-declared original, byte-identical to the dated original page modulo
+#: the header banner and link targets (diff-verified on 16/1993; exists on
+#: every law probed: fresh 2026 laws, a repealed 1993 law, an Oznámenie).
+ALIAS_VER = "vyhlasene_znenie"
+
+#: Correction entries in the Collection ("Redakčné oznámenie" errata).
+_CORRECTION_NO = re.compile(r"c\d+(?:-r\d+)?$")
+
+
 def iri_parts(iri: str) -> tuple[str, str, str]:
-    """/SK/ZZ/2026/126/20260701 -> ("2026", "126", "20260701") or raise."""
+    """/SK/ZZ/2026/126/20260701 -> ("2026", "126", "20260701");
+
+    /SK/ZZ/2025/35/vyhlasene_znenie -> ("2025", "35", "vyhlasene_znenie").
+    Some listing rows carry a stray ".html" suffix on the trailing token
+    (probed 2026-09-16, /SK/ZZ/2019/83/…); it is stripped before the shape
+    check — normalization, not a shape change. Anything else raises.
+    """
     part = iri.split("/")
     if len(part) != 6 or part[1:3] != ["SK", "ZZ"]:
-        raise ValueError(f"iri {iri!r} is not /SK/ZZ/{{year}}/{{no}}/{{yyyymmdd}}")
+        raise ValueError(f"iri {iri!r} is not /SK/ZZ/{{year}}/{{no}}/{{ver}}")
     rocnik, number, ver = part[3], part[4], part[5]
-    if not (rocnik.isdigit() and number.isdigit() and ver.isdigit() and len(ver) == 8):
-        raise ValueError(f"iri {iri!r} is not /SK/ZZ/{{year}}/{{no}}/{{yyyymmdd}}")
+    ver = ver.removesuffix(".html")
+    # The number segment is either digits (a normal instrument) or the
+    # Collection's correction form c{N}-r{K} ("Redakčné oznámenie" errata,
+    # probed 2026-09-16, /SK/ZZ/2015/c98-r1/…).
+    if not (rocnik.isdigit() and (number.isdigit() or _CORRECTION_NO.match(number))):
+        raise ValueError(f"iri {iri!r} is not /SK/ZZ/{{year}}/{{no}}/{{ver}}")
+    if ver != ALIAS_VER and not (ver.isdigit() and len(ver) == 8):
+        raise ValueError(f"iri {iri!r} is not /SK/ZZ/{{year}}/{{no}}/{{ver}}")
     return rocnik, number, ver
+
+
+def alias_iri(rocnik: str, number: str) -> str:
+    """The as-declared original's stable iri for one instrument."""
+    return f"/SK/ZZ/{rocnik}/{number}/{ALIAS_VER}"
+
+
+def number_segment(number: str) -> str:
+    """Folder/filename segment for an instrument number: zero-padded digits
+    for laws, the correction token verbatim (separate namespace)."""
+    return f"{int(number):03d}" if number.isdigit() else number
 
 
 def canonical_html_url(iri: str) -> str:
@@ -140,11 +203,14 @@ def canonical_html_url(iri: str) -> str:
 def canonical_pdf_url(iri: str) -> str:
     """Official PDF of one version.
 
-    Derived from the page-native link's skeleton with the stale
-    ``/static/pdf`` prefix corrected to the live ``/pdf`` (probed
-    2026-09-08: the naive prefix 404s on both static and www hosts).
+    Dated versions: ``ZZ_{y}_{n}_{ver}.pdf``. The as-declared alias carries
+    its own undated PDF ``ZZ_{y}_{n}.pdf`` (probed 200 on both forms
+    2026-09-08/15; the page-native ``/static/pdf`` prefix is stale — see
+    module docstring).
     """
     rocnik, number, ver = iri_parts(iri)
+    if ver == ALIAS_VER:
+        return f"{PDF_BASE}/SK/ZZ/{rocnik}/{number}/ZZ_{rocnik}_{number}.pdf"
     return f"{PDF_BASE}/SK/ZZ/{rocnik}/{number}/ZZ_{rocnik}_{number}_{ver}.pdf"
 
 
@@ -215,6 +281,20 @@ def start_tasks(params: dict[str, Any]) -> list[TaskSeed]:
         if not raw_max.isdigit() or int(raw_max) < 1:
             raise _fail(f"max_docs must be a positive integer (got {raw_max!r})")
         seed_params["max_docs"] = int(raw_max)
+    # pdf=0 skips the PDF sibling entirely (HTML-only sweeps, e.g. the
+    # 2000–2025 backfill; user ruling 2026-09-08). Default stays 1 (plan Q2).
+    raw_pdf = str(params.get("pdf", "1")).strip()
+    if raw_pdf not in ("0", "1"):
+        raise _fail(f"pdf must be 0 or 1 (got {raw_pdf!r})")
+    seed_params["pdf"] = int(raw_pdf)
+    # versions=1 additionally fetches every dated version listed in each
+    # page's embedded "História" table (version channel, probed
+    # 2026-09-15). The version timeline itself lands in meta either way.
+    raw_versions = str(params.get("versions", "0")).strip()
+    if raw_versions not in ("0", "1"):
+        raise _fail(f"versions must be 0 or 1 (got {raw_versions!r})")
+    if raw_versions == "1":
+        seed_params["versions"] = 1
     return [TaskSeed(type="svk_list", params=seed_params)]
 
 
