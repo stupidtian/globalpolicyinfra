@@ -86,6 +86,11 @@ class RequestSpec:
     APIs where "not found" legitimately means "nothing published that day",
     e.g. the BOE daily summary; first adopted for ESP 2026-09-01). The
     parser, not the framework, decides what the not-found response means.
+
+    ``method``/``json_body`` (2026-09-16, user-ruled contract evolution, first
+    consumer DNK retsinformation): HTTP method of the single request —
+    "GET" (default, semantics untouched) or "POST" — and for POST the JSON
+    request body (``None`` = bodyless POST).
     """
 
     url: str
@@ -96,6 +101,8 @@ class RequestSpec:
     transport: str = "http"
     browser_plan: list[tuple[str, dict[str, Any]]] = field(default_factory=list)
     accept_not_found: bool = False
+    method: str = "GET"
+    json_body: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True)
@@ -179,6 +186,13 @@ class SourceDefinition:
     The ledger's upsert is UPDATE-then-INSERT keyed on these, so country
     rows may be partial (merge into the existing row) without tripping
     NOT NULL constraints on the insert path.
+
+    ``parallel_safe`` (framework-concurrency ruling 1.4): declares that any
+    task of this source may run on any worker thread with any session —
+    no cross-task transport-layer state (cookies/tokens) dependency. Only
+    sources declaring True can use ``--workers >= 2``; the engine auto-caps
+    undeclared sources to one worker with a warning, so session-bound
+    sources (e.g. German-style session chains) can never be hurt.
     """
 
     name: str
@@ -187,3 +201,4 @@ class SourceDefinition:
     domain_schema: str = ""  # DDL executed once when the ledger opens
     domain_tables: tuple[str, ...] = ()  # for status counting / inspection
     domain_keys: dict[str, tuple[str, ...]] = field(default_factory=dict)
+    parallel_safe: bool = False

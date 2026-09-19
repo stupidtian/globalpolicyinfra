@@ -83,6 +83,12 @@ def build_parser() -> argparse.ArgumentParser:
         "never stored in task params or the ledger",
     )
     collect_parser.add_argument(
+        "--workers", type=int, default=1, metavar="N",
+        help="Worker threads for parallel fetching (default 1 = serial). "
+        "Only sources declaring parallel_safe=true use more than one; "
+        "runtime-only — never stored in task params or the ledger",
+    )
+    collect_parser.add_argument(
         "--config-file", default=None,
         help="Explicit config file location (default: ~/.globalpolicyinfra/config.toml).",
     )
@@ -248,6 +254,9 @@ def _resolve_source(args: argparse.Namespace, country: str) -> tuple[SourceDefin
 def _run_collect(args: argparse.Namespace) -> int:
     country = args.country.upper()
     params = _parse_kv_params(args.params)
+    if args.workers < 1:
+        print("error: --workers must be >= 1", file=sys.stderr)
+        return 2
     source, data_root = _resolve_source(args, country)
     paths.ensure_layout(data_root, country)
     # Single-process lock (framework-hardening 1.2): dry-run never locks
@@ -281,7 +290,9 @@ def _run_collect(args: argparse.Namespace) -> int:
                 if args.delay
                 else HttpTransport()
             )
-            engine = TaskEngine(store, data_root, country, source, transport)
+            engine = TaskEngine(
+                store, data_root, country, source, transport, max_workers=args.workers
+            )
             report = engine.run(params, dry_run=args.dry_run)
     finally:
         if lock is not None:

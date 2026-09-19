@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import os
 import random
+import threading
 import time
 from typing import Any, Protocol
 
@@ -34,7 +35,13 @@ class Transport(Protocol):
 
 
 class HttpTransport:
-    """GET-oriented HTTP transport with per-request retry and politeness."""
+    """GET-oriented HTTP transport with per-request retry and politeness.
+
+    Concurrency (framework-concurrency rulings 1.3/1.5): the politeness
+    delay is a **global** rate gate shared by every worker thread, and each
+    thread gets its own :class:`requests.Session` (cookies never cross
+    workers). With a single worker both behaviors are exactly today's.
+    """
 
     DEFAULT_USER_AGENT = (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -53,8 +60,41 @@ class HttpTransport:
         self.delay_range = delay_range
         self.max_retries = max_retries
         self.timeout = timeout
-        self.session = session or requests.Session()
-        self.session.headers.update({"User-Agent": self.DEFAULT_USER_AGENT})
+        self._injected_session = session
+        if session is not None:
+            session.headers.update({"User-Agent": self.DEFAULT_USER_AGENT})
+        self._local = threading.local()
+        self._pace_lock = threading.Lock()
+        self._next_slot = 0.0
+
+    def session(self) -> requests.Session:
+        """The calling thread's session. An explicitly injected session is
+        shared as-is (single worker / tests); otherwise each thread creates
+        its own — requests.Session is not thread-safe and cookie state must
+        not cross workers (ruling 1.5)."""
+        if self._injected_session is not None:
+            return self._injected_session
+        existing = getattr(self._local, "session", None)
+        if existing is None:
+            existing = requests.Session()
+            existing.headers.update({"User-Agent": self.DEFAULT_USER_AGENT})
+            self._local.session = existing
+        return existing
+
+    def acquire_pace_slot(self) -> float:
+        """Global rate gate (token-bucket semantics, capacity 1, random
+        refill): returns the number of seconds the caller must sleep
+        before issuing its request.
+
+        Request starts are globally spaced ``uniform(MIN, MAX)`` — with one
+        worker that is exactly today's per-request sleep; with N workers the
+        total rate stays ``1 / mean(interval)`` and never multiplies with
+        the worker count (ruling 1.3)."""
+        with self._pace_lock:
+            now = time.monotonic()
+            wait = max(0.0, self._next_slot - now) + random.uniform(*self.delay_range)
+            self._next_slot = now + wait
+        return wait
 
     def fetch(self, spec: RequestSpec) -> Response:
         """Execute one RequestSpec → Response, classifying terminal failure
@@ -70,16 +110,34 @@ class HttpTransport:
             params[spec.key_param] = key
 
         url = spec.url
+        session = self.session()
+        method = (spec.method or "GET").upper()
         last_error: Exception | None = None
         for attempt in range(1, self.max_retries + 1):
-            time.sleep(random.uniform(*self.delay_range))
+            time.sleep(self.acquire_pace_slot())
             try:
-                response = self.session.get(
-                    url,
-                    params=params or None,
-                    headers=spec.headers or None,
-                    timeout=self.timeout,
-                )
+                if method == "GET":
+                    response = session.get(
+                        url,
+                        params=params or None,
+                        headers=spec.headers or None,
+                        timeout=self.timeout,
+                    )
+                elif method == "POST":
+                    # json_body=None keeps a bodyless POST; a dict is sent as
+                    # the JSON body (first consumer: DNK retsinformation's
+                    # documentHtml endpoint, 2026-09-16).
+                    response = session.post(
+                        url,
+                        params=params or None,
+                        json=spec.json_body,
+                        headers=spec.headers or None,
+                        timeout=self.timeout,
+                    )
+                else:
+                    raise PermanentError(
+                        f"Unsupported transport method {method!r} for {url}"
+                    )
             except requests.RequestException as exc:
                 last_error = exc
                 time.sleep(min(30.0, 2.0**attempt))

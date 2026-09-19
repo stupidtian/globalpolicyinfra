@@ -22,12 +22,13 @@ from __future__ import annotations
 
 import json
 import sys
+from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
-from adapters.base import Response, SourceDefinition, TaskSeed, TaskView
+from adapters.base import Response, SourceDefinition, TaskResult, TaskSeed, TaskView
 from core import paths
 from core.state import Status
 from runtime.errors import PermanentError, TransientError
@@ -70,6 +71,10 @@ class EngineReport:
 class TaskEngine:
     """Drives one country × source against its ledger."""
 
+    #: Tasks per dispatch round on the parallel path = factor × workers
+    #: (internal constant, deliberately not a CLI knob — plan Q4).
+    _BATCH_FACTOR = 4
+
     def __init__(
         self,
         store: StateStore,
@@ -79,6 +84,7 @@ class TaskEngine:
         transport: Transport | None = None,
         *,
         retry_policy: RetryPolicy | None = None,
+        max_workers: int = 1,
     ) -> None:
         self.store = store
         self.country_root = paths.country_dir(data_root, country_code)
@@ -86,6 +92,7 @@ class TaskEngine:
         self.source = source
         self.transport = transport
         self.retry_policy = retry_policy or RetryPolicy()
+        self.max_workers = max_workers
         self._warned_foreign: set[str] = set()
 
     # -- public entry points ----------------------------------------------------
@@ -117,6 +124,15 @@ class TaskEngine:
     # -- internals -----------------------------------------------------------------
 
     def _work(self, report: EngineReport) -> None:
+        """Dispatch (ruling 1.1): the default (max_workers=1) takes the
+        serial path below, byte-for-byte the pre-concurrency loop; only an
+        explicit >= 2 ever enters the parallel machinery."""
+        if self.max_workers >= 2:
+            self._work_parallel(report)
+            return
+        self._work_serial(report)
+
+    def _work_serial(self, report: EngineReport) -> None:
         own_types = set(self.source.task_types)
         self._warn_foreign_due(own_types, report)
         while True:
@@ -131,6 +147,169 @@ class TaskEngine:
         # Second checkpoint: catches unknown types our own parse enqueued
         # mid-run (still first-wins per type, so no repeat warnings).
         self._warn_foreign_due(own_types, report)
+
+    # -- parallel path (framework-concurrency, rulings 1.2/1.4) -------------------
+
+    def _work_parallel(self, report: EngineReport) -> None:
+        """Thread-pool path: workers run build_request → fetch → parse only
+        (I/O plus pure functions); every ledger write happens on the main
+        thread in :meth:`_commit`, so the store keeps a single writer.
+        Bounded batches keep the in-flight set small and SIGINT simple."""
+        if not self.source.parallel_safe:
+            print(
+                f"[warn] source {self.source.name!r} is not declared parallel_safe — "
+                "running with 1 worker (declare parallel_safe=True on the "
+                "SourceDefinition if the source has no cross-task session state)",
+                file=sys.stderr,
+            )
+            self._work_serial(report)
+            return
+        own_types = set(self.source.task_types)
+        self._warn_foreign_due(own_types, report)
+        batch_size = max(4, self._BATCH_FACTOR * self.max_workers)
+        pool = ThreadPoolExecutor(
+            max_workers=self.max_workers, thread_name_prefix="gpi-worker"
+        )
+        # SIGINT best-effort (plan): KeyboardInterrupt propagates through
+        # the finally below — dispatching stops, not-yet-started work is
+        # cancelled, in-flight requests finish uninterpreted; anything
+        # uncommitted stays pending and is redone on the next run (ledger
+        # idempotency is the backstop).
+        try:
+            while True:
+                due = self.store.iter_due_tasks(types=own_types)
+                if not due:
+                    break
+                futures: list[Future[_IOOutcome]] = []
+                for task_id in due[:batch_size]:
+                    task = self.store.get_task(task_id)
+                    if task is None:  # pragma: no cover - raced deletion
+                        continue
+                    futures.append(pool.submit(self._execute_io, task))
+                for future in as_completed(futures):
+                    self._commit(future.result(), report)
+        finally:
+            pool.shutdown(wait=False, cancel_futures=True)
+        self._warn_foreign_due(own_types, report)
+
+    def _execute_io(self, task: dict[str, Any]) -> _IOOutcome:
+        """Worker half of one task: build_request → fetch → parse. No store
+        access whatsoever (the sqlite connection must never cross threads).
+        Classification mirrors _execute exactly; ledger writes happen later
+        on the main thread."""
+        view = TaskView(
+            task_id=task["task_id"],
+            type=task["type"],
+            params=task["params"],
+            signal=task.get("signal"),
+        )
+        handler = self.source.task_types.get(view.type)
+        if handler is None:
+            return _IOOutcome(task=task, kind="guard")
+        try:
+            spec = handler.build_request(view)
+            if spec.transport != "http":
+                raise PermanentError(
+                    f"Transport {spec.transport!r} is not implemented yet (section 6.6)."
+                )
+            if self.transport is None:
+                raise PermanentError("No transport configured for this engine.")
+            response = self.transport.fetch(spec)
+        except TransientError as exc:
+            return _IOOutcome(task=task, kind="transient", error=exc)
+        except PermanentError as exc:
+            return _IOOutcome(task=task, kind="permanent", error=exc)
+        except Exception as exc:  # noqa: BLE001 — unknown errors are a classified outcome
+            return _IOOutcome(task=task, kind="escalate", error=exc)
+        try:
+            result = handler.parse(response, view)
+        except TransientError as exc:
+            return _IOOutcome(task=task, kind="transient", error=exc, response=response)
+        except PermanentError as exc:
+            return _IOOutcome(task=task, kind="permanent", error=exc, response=response)
+        except Exception as exc:  # noqa: BLE001
+            return _IOOutcome(task=task, kind="escalate", error=exc, response=response)
+        return _IOOutcome(task=task, kind="result", result=result, response=response)
+
+    def _commit(self, outcome: _IOOutcome, report: EngineReport) -> None:
+        """Main-thread half: apply one worker outcome through the same
+        trisection and bookkeeping as the serial path (single writer,
+        ruling 1.2)."""
+        task = outcome.task
+        task_id = task["task_id"]
+        attempt_number = task["attempts"] + 1
+
+        if outcome.kind == "result":
+            result, response = outcome.result, outcome.response
+            assert result is not None and response is not None
+            if result.is_empty() and not result.expected_empty:
+                report.empty_warned += 1
+                print(
+                    f"[warn] empty result for {task['type']} {task_id} — "
+                    "archived raw response for inspection",
+                    file=sys.stderr,
+                )
+                self._archive_failure(task, response, "empty result")
+            try:
+                self._write_files(result)
+                summary = self.store.write_batch(task_id, self.country_code, result)
+            except PermanentError as exc:
+                self.store.record_task_outcome(
+                    task_id, Status.FAILED_PERMANENT, error=_describe(exc)
+                )
+                report.failed_permanent += 1
+                return
+            except Exception as exc:  # noqa: BLE001 — unknown errors are a classified outcome
+                self.store.record_task_outcome(
+                    task_id, Status.NEEDS_AGENT, error=_describe(exc)
+                )
+                report.escalated += 1
+                return
+            report.done += 1
+            counter = report.detail
+            counter["rows"] = counter.get("rows", 0) + summary["rows"]
+            counter["documents"] = counter.get("documents", 0) + summary["documents"]
+            counter["tasks"] = counter.get("tasks", 0) + summary["tasks"]
+            return
+
+        if outcome.kind == "transient":
+            assert outcome.error is not None
+            if outcome.response is not None:  # parse-side failure: keep evidence
+                self._archive_failure(task, outcome.response, _describe(outcome.error))
+            self._record_transient(task_id, attempt_number, outcome.error, report)
+            return
+        if outcome.kind == "permanent":
+            assert outcome.error is not None
+            if outcome.response is not None:
+                self._archive_failure(task, outcome.response, _describe(outcome.error))
+            self.store.record_task_outcome(
+                task_id, Status.FAILED_PERMANENT, error=_describe(outcome.error)
+            )
+            report.failed_permanent += 1
+            return
+        if outcome.kind == "escalate":
+            assert outcome.error is not None
+            if outcome.response is not None:
+                self._archive_failure(task, outcome.response, _describe(outcome.error))
+            self.store.record_task_outcome(
+                task_id, Status.NEEDS_AGENT, error=_describe(outcome.error)
+            )
+            report.escalated += 1
+            return
+        # guard: a fetched task without a handler (race between pull and
+        # execute, or a renamed type) — skip, never kill (hardening 1.1).
+        print(
+            f"[warn] due task {task_id} of type {task['type']!r} has no handler "
+            "in this source — left pending (other source or renamed type)",
+            file=sys.stderr,
+        )
+        self._warned_foreign.add(task["type"])
+        self.store.note_event(
+            "engine",
+            f"foreign:{task['type']}",
+            f"task {task_id} skipped by the execution guard; left pending",
+        )
+        report.skipped_foreign += 1
 
     def _warn_foreign_due(self, own_types: set[str], report: EngineReport) -> None:
         """Visibility for due tasks this source cannot run (other sources'
@@ -327,6 +506,20 @@ class TaskEngine:
                 f"{len(ids)} — left pending"
             )
         return len(seeds)
+
+
+@dataclass
+class _IOOutcome:
+    """What one worker produced for one task (ruling 1.2): workers never
+    touch the store — the classified outcome travels back to the main
+    thread, where :meth:`TaskEngine._commit` applies the very same
+    trisection code as the serial path."""
+
+    task: dict[str, Any]
+    kind: Literal["result", "transient", "permanent", "escalate", "guard"]
+    result: TaskResult | None = None
+    response: Response | None = None
+    error: Exception | None = None
 
 
 def _describe(exc: Exception) -> str:
