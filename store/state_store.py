@@ -77,6 +77,17 @@ CREATE TABLE IF NOT EXISTS kv (
     value TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS cleaned (
+    doc_id TEXT PRIMARY KEY,
+    version INTEGER NOT NULL,
+    local_path TEXT NOT NULL,
+    file_hash TEXT NOT NULL,
+    content_length INTEGER NOT NULL,
+    char_count INTEGER NOT NULL,
+    task_id TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS events (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     ts TEXT NOT NULL,
@@ -326,7 +337,7 @@ class StateStore:
         in between leaves harmless orphans (task not done → re-run rewrites).
         """
         now = utc_now_iso()
-        summary = {"rows": 0, "documents": 0, "tasks": 0, "cursors": 0}
+        summary = {"rows": 0, "documents": 0, "tasks": 0, "cursors": 0, "cleaned": 0}
         with self.transaction() as conn:
             task_row = conn.execute(
                 "SELECT status, attempts FROM tasks WHERE task_id = ?", (task_id,)
@@ -392,6 +403,33 @@ class StateStore:
                         ),
                     )
 
+            for cleaned_record in result.cleaned:
+                # One row per doc_id, newest version wins (the engine has
+                # already written the txt to disk; path is derived, never
+                # country-declared). Cleaning output must NOT touch the
+                # documents row — that is the raw file's identity.
+                conn.execute(
+                    "INSERT INTO cleaned (doc_id, version, local_path, file_hash, "
+                    "content_length, char_count, task_id, updated_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?) "
+                    "ON CONFLICT(doc_id) DO UPDATE SET version = excluded.version, "
+                    "local_path = excluded.local_path, file_hash = excluded.file_hash, "
+                    "content_length = excluded.content_length, "
+                    "char_count = excluded.char_count, task_id = excluded.task_id, "
+                    "updated_at = excluded.updated_at",
+                    (
+                        cleaned_record.doc_id,
+                        cleaned_record.version,
+                        paths.cleaned_rel_path(cleaned_record.doc_id),
+                        hashlib.sha256(cleaned_record.content).hexdigest(),
+                        len(cleaned_record.content),
+                        len(cleaned_record.content.decode("utf-8")),
+                        task_id,
+                        now,
+                    ),
+                )
+                summary["cleaned"] += 1
+
             for seed in result.next_tasks:
                 self.enqueue(seed)
                 summary["tasks"] += 1
@@ -422,6 +460,42 @@ class StateStore:
                 "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
                 (key, value),
             )
+
+    def get_document_local_path(self, doc_id: str) -> str | None:
+        """Local path (country-root-relative) of one document's raw file —
+        the resolution half of a ``local_doc`` request
+        (framework-cleaning 2.1). None = no row or no file recorded."""
+        row = self._conn.execute(
+            "SELECT local_path FROM documents WHERE doc_id = ?", (doc_id,)
+        ).fetchone()
+        return None if row is None else row["local_path"]
+
+    def clean_pending_targets(
+        self, targets: Sequence[str], version: int
+    ) -> list[tuple[str, str]]:
+        """doc_ids whose producing task type is in ``targets`` and which
+        have no ``cleaned`` row at ``version`` or newer — the cleaning seed
+        scan (framework-cleaning 2.5). Returns ``(doc_id, producing task
+        type)`` pairs; params for the seeds are built by the caller as
+        ``{doc_id, v, kind}`` (kind = the producing type, for parse
+        branching)."""
+        if not targets:
+            return []
+        placeholders = ", ".join("?" for _ in targets)
+        rows = self._conn.execute(
+            f"""
+            SELECT d.doc_id, t.type FROM documents d
+            JOIN tasks t ON t.task_id = d.produced_by
+            WHERE t.type IN ({placeholders}) AND d.local_path IS NOT NULL
+              AND NOT EXISTS (
+                  SELECT 1 FROM cleaned c
+                  WHERE c.doc_id = d.doc_id AND c.version >= ?
+              )
+            ORDER BY d.doc_id
+            """,
+            (*targets, version),
+        ).fetchall()
+        return [(row["doc_id"], row["type"]) for row in rows]
 
     def note_event(self, entity_type: str, subject_id: str, detail: str) -> None:
         """Append one audit event outside any task lifecycle — engine-level
@@ -579,6 +653,9 @@ class StateStore:
             "tasks": by_type,
             "documents": int(
                 self._conn.execute("SELECT COUNT(*) AS n FROM documents").fetchone()["n"]
+            ),
+            "cleaned": int(
+                self._conn.execute("SELECT COUNT(*) AS n FROM cleaned").fetchone()["n"]
             ),
             "domain": domain,
             "kv": {row["key"]: row["value"] for row in kv_rows},

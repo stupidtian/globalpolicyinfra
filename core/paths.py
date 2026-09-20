@@ -37,6 +37,7 @@ Notes:
 
 from __future__ import annotations
 
+import hashlib
 from pathlib import Path
 
 __all__ = [
@@ -45,6 +46,8 @@ __all__ = [
     "RAW_FORMATS",
     "chunk_dir",
     "cleaned_dir",
+    "cleaned_rel_path",
+    "cleaned_txt_path",
     "country_dir",
     "ensure_layout",
     "extracted_dir",
@@ -124,6 +127,21 @@ def extracted_dir(data_root: str | Path, country_code: str, subdir: str) -> Path
 def state_db_path(data_root: str | Path, country_code: str) -> Path:
     """``{ISO3}_policy/state.db`` — per-country SQLite operational state."""
     return country_dir(data_root, country_code) / STATE_DB_FILE_NAME
+
+
+def cleaned_rel_path(doc_id: str) -> str:
+    """Relative location of one document's cleaned text:
+    ``02_cleaned/{sha256(doc_id)[:2]}/{doc_id}.txt``. Hash-sharded so no
+    single directory ever holds hundreds of thousands of files
+    (framework-cleaning, 2026-09-19). Derived by the framework only —
+    country packs never construct this path."""
+    shard = hashlib.sha256(doc_id.encode("utf-8")).hexdigest()[:2]
+    return f"02_cleaned/{shard}/{doc_id}.txt"
+
+
+def cleaned_txt_path(data_root: str | Path, country_code: str, doc_id: str) -> Path:
+    """Absolute path of one document's cleaned text file."""
+    return country_dir(data_root, country_code) / cleaned_rel_path(doc_id)
 
 
 def ensure_layout(data_root: str | Path, country_code: str) -> None:
