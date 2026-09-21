@@ -17,8 +17,8 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from __version__ import __version__
-from adapters.base import SourceDefinition
-from adapters.registry import RegistryError, get_source
+from adapters.base import SourceDefinition, TaskSeed
+from adapters.registry import RegistryError, discover, get_source
 from core import paths
 from core.config import (
     ConfigError,
@@ -89,6 +89,30 @@ def build_parser() -> argparse.ArgumentParser:
         "runtime-only — never stored in task params or the ledger",
     )
     collect_parser.add_argument(
+        "--config-file", default=None,
+        help="Explicit config file location (default: ~/.globalpolicyinfra/config.toml).",
+    )
+
+    clean_parser = subparsers.add_parser(
+        "clean",
+        help="Run declared cleaning rules over collected documents "
+        "(local reads only — no network, no delay, no session).",
+    )
+    clean_parser.add_argument("--country", required=True, help="ISO3 code, e.g. kor")
+    clean_parser.add_argument(
+        "--source", default=None,
+        help="One source (default: every source of the country declaring clean)",
+    )
+    clean_parser.add_argument(
+        "--limit", type=int, default=None, metavar="N",
+        help="Seed at most N documents per source (eyeball a small batch "
+        "before a full run)",
+    )
+    clean_parser.add_argument(
+        "--dry-run", action="store_true",
+        help="Show what would be seeded and what is already due; nothing enqueued or cleaned",
+    )
+    clean_parser.add_argument(
         "--config-file", default=None,
         help="Explicit config file location (default: ~/.globalpolicyinfra/config.toml).",
     )
@@ -306,6 +330,116 @@ def _run_collect(args: argparse.Namespace) -> int:
     return 0
 
 
+def _run_clean(args: argparse.Namespace) -> int:
+    """``clean`` (framework-cleaning 2.5): seed cleaning tasks from the
+    declarations, then run them through the engine with a narrowed type
+    set. Local reads only. Lock/exit codes align with collect (same lock
+    file, busy=3, dry-run never locks)."""
+    country = args.country.upper()
+    if args.limit is not None and args.limit < 1:
+        print("error: --limit must be >= 1", file=sys.stderr)
+        return 2
+    try:
+        data_root = resolve_data_root(config_path=args.config_file)
+    except ConfigError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    try:
+        if args.source:
+            sources = [get_source(country, args.source)]
+        else:
+            sources = [
+                definition
+                for (c, _name), definition in sorted(discover().items())
+                if c == country and definition.clean is not None
+            ]
+    except RegistryError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    decls = [(s, s.clean) for s in sources if s.clean is not None]
+    if not decls:
+        print(
+            f"error: no source of {country} declares a clean definition "
+            "(SourceDefinition.clean)",
+            file=sys.stderr,
+        )
+        return 2
+
+    paths.ensure_layout(data_root, country)
+    lock: CollectLock | None = None
+    took_over = False
+    previous_pid: int | None = None
+    if not args.dry_run:
+        lock = CollectLock(paths.country_dir(data_root, country))
+        try:
+            acquired = lock.acquire()
+        except LockBusyError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 3  # same lock-busy contract as collect
+        took_over = acquired.took_over
+        previous_pid = acquired.previous_pid
+    try:
+        with StateStore.for_country(data_root, country) as store:
+            if took_over:
+                store.note_event(
+                    "engine",
+                    "collect.lock",
+                    f"lock taken over from stale holder (pid {previous_pid}); "
+                    "previous run likely crashed",
+                )
+            if args.dry_run:
+                print("dry-run — nothing enqueued, nothing cleaned")
+                union_types: set[str] = set()
+                for source, decl in decls:
+                    assert decl is not None
+                    pairs = store.clean_pending_targets(decl.targets, decl.version)
+                    if args.limit is not None:
+                        pairs = pairs[: args.limit]
+                    union_types.add(decl.task_type)
+                    print(
+                        f"  [{source.name}] would seed {len(pairs)} "
+                        f"{decl.task_type} task(s) at v={decl.version}"
+                    )
+                    for shown, (doc_id, kind) in enumerate(pairs[:20], start=1):
+                        print(f"    [{decl.task_type}] doc_id={doc_id} kind={kind}")
+                    if len(pairs) > 20:
+                        print(f"    … and {len(pairs) - shown} more")
+                due = store.iter_due_tasks(types=union_types)
+                print(f"  clean tasks already due in ledger: {len(due)}")
+                return 0
+            for source, decl in decls:
+                assert decl is not None
+                pairs = store.clean_pending_targets(decl.targets, decl.version)
+                if args.limit is not None:
+                    pairs = pairs[: args.limit]
+                seeded = 0
+                for doc_id, kind in pairs:
+                    _task_id, changed = store.enqueue(
+                        TaskSeed(
+                            type=decl.task_type,
+                            params={"doc_id": doc_id, "v": decl.version, "kind": kind},
+                        )
+                    )
+                    seeded += 1 if changed else 0
+                if seeded:
+                    store.note_event(
+                        "engine",
+                        f"clean.seeds:{source.name}",
+                        f"seeded {seeded} {decl.task_type} tasks (v={decl.version})",
+                    )
+                engine = TaskEngine(store, data_root, country, source, None)
+                report = engine.run_cleaning({decl.task_type})
+                print(f"[{country}/{source.name}] clean finished")
+                for line in report.summary_lines():
+                    print(f"  {line}")
+                for key in sorted(report.detail):
+                    print(f"  {key}: {report.detail[key]}")
+    finally:
+        if lock is not None:
+            lock.release()
+    return 0
+
+
 def _run_status(args: argparse.Namespace) -> int:
     try:
         data_root = resolve_data_root(config_path=args.config_file)
@@ -328,6 +462,8 @@ def _run_status(args: argparse.Namespace) -> int:
         rendered = ", ".join(f"{s}: {n}" for s, n in sorted(counts.items()))
         print(f"  {task_type}: {rendered}")
     print(f"  documents: {status['documents']}")
+    if status.get("cleaned"):
+        print(f"  cleaned: {status['cleaned']}")
     for table, count in sorted(status["domain"].items()):
         print(f"  {table}: {count if count >= 0 else '(table not created)'}")
     for key, value in sorted(status["kv"].items()):
@@ -345,10 +481,12 @@ def _run_export(args: argparse.Namespace) -> int:
     with StateStore.for_country(data_root, country) as store:
         rows = store.connection.execute(
             """
-            SELECT doc_id, country_code, title, publication_date, doc_type,
-                   entity_ref, produced_by, raw_format, local_path, file_hash,
-                   content_length, source_url
-            FROM documents ORDER BY doc_id
+            SELECT d.doc_id, d.country_code, d.title, d.publication_date, d.doc_type,
+                   d.entity_ref, d.produced_by, d.raw_format, d.local_path, d.file_hash,
+                   d.content_length, d.source_url,
+                   c.version AS clean_version, c.char_count AS clean_chars
+            FROM documents d LEFT JOIN cleaned c ON c.doc_id = d.doc_id
+            ORDER BY d.doc_id
             """
         ).fetchall()
     import pandas as pd
@@ -623,6 +761,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         return _run_config(args)
     if args.command == "collect":
         return _run_collect(args)
+    if args.command == "clean":
+        return _run_clean(args)
     if args.command == "status":
         return _run_status(args)
     if args.command == "export":
