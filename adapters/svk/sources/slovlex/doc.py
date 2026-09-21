@@ -180,10 +180,20 @@ class SvkDocHandler:
                 f"page of {iri} numbers itself {page_cislo!r}, listing said "
                 f"{params['cislo']!r}"
             )
-        page_declared = sk_date_to_iso(_require(info, "Dátum vyhlásenia", iri))
-        if page_declared is None:
-            raise ValueError(f"page of {iri} has an unparsable Dátum vyhlásenia")
-        if page_declared != str(params["vyhlaseny"]):
+        partial_meta = False
+        declared_raw = info.get("Dátum vyhlásenia", "").strip()
+        if declared_raw:
+            page_declared = sk_date_to_iso(declared_raw)
+            if page_declared is None:
+                raise ValueError(f"page of {iri} has an unparsable Dátum vyhlásenia")
+        else:
+            # Some dated version pages carry a minimal InfoTable (only the
+            # number and the validity window — the source never entered the
+            # rest; probed 2026-09-17, /SK/ZZ/2009/207/20130101). The text
+            # is the value: the event's listing fields stand in, flagged.
+            page_declared = None
+            partial_meta = True
+        if page_declared is not None and page_declared != str(params["vyhlaseny"]):
             # Probed in production (2026-09-15, 201/2022 Z. z.): the listing
             # regenerates dead instruments' rows with their END date in every
             # date field — the row is the instrument's only index entry, so
@@ -192,25 +202,34 @@ class SvkDocHandler:
             listing_date = str(params["vyhlaseny"])
         else:
             listing_date = ""
-        page_typ = _require(info, "Typ", iri)
-        if page_typ != str(params["typ_predp_value"]):
+        page_typ = info.get("Typ", "").strip()
+        if page_typ and page_typ != str(params["typ_predp_value"]):
             raise ValueError(
                 f"page of {iri} types itself {page_typ!r}, listing said "
                 f"{params['typ_predp_value']!r}"
             )
-        title = _require(info, "Názov", iri)
+        if not page_typ:
+            partial_meta = True
+        title = info.get("Názov", "").strip() or str(params["nazov"])
+        if not info.get("Názov", "").strip():
+            partial_meta = True
 
         rocnik, _number, ver = iri_parts(iri)
-        publication_date = page_declared
+        publication_date = (
+            page_declared if page_declared is not None else str(params["vyhlaseny"])
+        )
         machine_type = params.get("typ_predp")
         meta: dict[str, str] = {
             "typ_predp_value": str(params["typ_predp_value"]),
             "cislo": str(params["cislo"]),
             "rocnik": rocnik,
             "verzia": ver,
-            "datum_vyhlasenia": page_declared,
             "pdf_url": canonical_pdf_url(iri),
         }
+        if page_declared is not None:
+            meta["datum_vyhlasenia"] = page_declared
+        if partial_meta:
+            meta["page_meta_partial"] = "true"
         if machine_type is not None:
             meta["typ_predp"] = str(machine_type)
         if listing_date:
