@@ -52,8 +52,13 @@ _HEADERS = {"User-Agent": USER_AGENT}
 _DT_ISSUE_RE = re.compile(
     r'<dt><a href="javascript:void\(0\);">([^<]+)</a></dt>'
 )
-#: Issue-type word + number inside any label.
-_ISSUE_NO_RE = re.compile(r"(本紙|号外|特別号外|政府調達)[\s\u3000(（]*第(\d+)号")
+#: Issue-type word + number inside any label. 目録 (m) is the monthly
+#: index issue published around the 8th (probed 2026-09-21: label
+#: ``目録　第1721号``, own letter code ``20260608m01721``, numbered after
+#: that day's 本紙) — a derivative index, excluded via the types filter.
+_ISSUE_NO_RE = re.compile(
+    r"(本紙|号外|特別号外|政府調達|目録)[\s\u3000(（]*第(\d+)号"
+)
 #: Section heading of either level; text in the first span.text (some
 #: headings append a page span, some old ones have bare text).
 _HEADING_RE = re.compile(r"<h([234])[^>]*>(.*?)</h\1>", re.DOTALL)
@@ -381,19 +386,23 @@ class KanpoIssueHandler:
         body = html[start:] if start >= 0 else html
         entries = _walk_entries(body)
         linkless = _count_linkless(body)
+        n_headings = len(_HEADING_RE.findall(body))
         if not entries:
-            if linkless:
-                # A listed issue whose entire content the archive never
-                # retained (pre-2025-04-01): every entry is linkless.
+            if linkless or n_headings:
+                # A listed issue whose content the archive never retained:
+                # entries linkless (pre-2025 pruned rows) or sections
+                # rendered empty (probed 2026-09-20: 2004 特別号外 whose
+                # only section is a bare 国会事項 heading with a page).
                 return TaskResult(
                     expected_empty=(
-                        f"issue {issue}: {linkless} entries, all outside the "
-                        "online archive's retention (linkless TOC rows)"
+                        f"issue {issue}: no retained entries ({linkless} "
+                        f"linkless rows, {n_headings} section headings) — "
+                        "content outside the online archive's retention"
                     )
                 )
             raise ValueError(
-                f"issue {issue}: contentsBox carries no entries at all — "
-                "unexpected for a listed issue"
+                f"issue {issue}: contentsBox carries no entries and no "
+                "sections — unexpected for a listed issue"
             )
 
         seeds: list[TaskSeed] = []

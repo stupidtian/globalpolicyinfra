@@ -298,4 +298,7 @@ def build_source() -> SourceDefinition:
             "kanpo_issue": KanpoIssueHandler(),
             "kanpo_doc": KanpoDocHandler(),
         },
+        # Stateless GETs end to end (no cookies, no tokens — probed
+        # 2026-09-07); any task may run on any worker with any session.
+        parallel_safe=True,
     )
