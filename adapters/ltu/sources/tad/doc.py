@@ -39,8 +39,14 @@ _TAD_ID_RE = re.compile(r"legalAct/lt/TAD/([A-Za-z0-9.]+)")
 _TITLE_RE = re.compile(r'<span id="mainForm:laTitle">(.*?)</span>', re.DOTALL)
 _SCRIPT_RE = re.compile(r"<script.*?</script>", re.DOTALL)
 _TAG_RE = re.compile(r"<[^>]+>")
-_PUBLISHED_RE = re.compile(r"^(?P<medium>[^,]+),\s*(?P<date>\d{4}-\d{2}-\d{2}),\s*Nr\.\s*(?P<number>\S+)")
+_PUBLISHED_RE = re.compile(
+    r"^(?P<medium>[^,]+),\s*(?P<date>\d{4}-\d{2}-\d{2})(?:,\s*Nr\.\s*(?P<number>\S+))?"
+)
 _VALID_FROM_RE = re.compile(r'class="validFrom">\s*Įsigalioja\s+([\d-]+)')
+#: The labelled publication cell itself (the anchor distinguishing "the
+#: cell is there but empty" from "the cell is gone" — the page's
+#: chronology bar also carries the word Paskelbta).
+_PUBLISHED_CELL_RE = re.compile(r">Paskelbta:\s*</td>")
 
 #: Rūšis (native type word) -> controlled doc_type. The native word is
 #: always kept in meta; cross-country typology is analysis-side.
@@ -101,6 +107,18 @@ class TadDocHandler:
                 "enumeration must exist; the detail entry may have moved"
             )
 
+        if len(response.content) == 0:
+            # Stable probed shape (2026-09-21, sample 32): for a handful of
+            # enumerated pids the detail endpoint answers HTTP 200 with an
+            # empty text/plain body — an access-restricted or withdrawn
+            # record that the search index still lists. Explained skip.
+            return TaskResult(
+                expected_empty=(
+                    f"tad_doc {pid}: the register serves an empty detail page "
+                    "(HTTP 200, no content) — access-restricted or withdrawn record"
+                )
+            )
+
         title_match = _TITLE_RE.search(html)
         if title_match is None:
             raise ValueError(f"tad_doc {pid}: no mainForm:laTitle title span in the page")
@@ -121,16 +139,53 @@ class TadDocHandler:
                 )
             )
 
+        adopted_by = _cell(html, "Priėmė")
+
+        scope = str(task.params.get("scope", ""))
         published = _cell(html, "Paskelbta")
+
+        # The corpus is *gazetted* acts: publication is what makes a
+        # document an enacted policy (section 5.3). Two probed shapes
+        # carry an EMPTY publication reference and are explained away
+        # under every scope: old municipal/procedural resolutions never
+        # gazetted (probed 2000-01, sample 30) and presidentially vetoed
+        # laws — "Nepasirašytas … Prezidento veto" (probed 2000-07,
+        # sample 31). The distinction is anchored on the label: if the
+        # Paskelbta CELL is present but empty -> never gazetted (skip);
+        # if the label itself is gone the shape has drifted and the task
+        # fails loud; a present but unparseable value also fails loud —
+        # neither failure mode may silently empty the corpus.
         if published is None:
+            if _PUBLISHED_CELL_RE.search(html):
+                return TaskResult(
+                    expected_empty=(
+                        f"tad_doc {pid}: empty publication reference (never gazetted, "
+                        "e.g. vetoed or municipal) — outside the gazetted-acts corpus"
+                    )
+                )
             raise ValueError(
-                f"tad_doc {pid}: no Paskelbta cell — a Lithuanian-language record "
-                "carries its gazette/TAR publication reference"
+                f"tad_doc {pid}: no Paskelbta cell — a Lithuanian-language "
+                "record carries its gazette/TAR publication reference"
             )
+
         published_match = _PUBLISHED_RE.match(published)
         if published_match is None:
             raise ValueError(f"tad_doc {pid}: unparseable Paskelbta value {published!r}")
         pub_iso = published_match.group("date")
+
+        # The resolutions slice enumerates the multi-issuer type code 31
+        # unfiltered (the search's p_org index has holes); the authority
+        # cell is the filter, and the choice travels in task params so
+        # widening later re-fetches automatically (ESP origen precedent).
+        if scope == "resolutions":
+            authority = re.sub(r"\s+", " ", adopted_by or "").strip()
+            if authority != "Lietuvos Respublikos Vyriausybė":
+                return TaskResult(
+                    expected_empty=(
+                        f"tad_doc {pid}: Nutarimas adopted by {authority or '?'} — "
+                        "outside the resolutions slice (Vyriausybė only)"
+                    )
+                )
 
         rusis = _cell(html, "Rūšis") or ""
         meta: dict[str, str] = {
@@ -146,14 +201,16 @@ class TadDocHandler:
         number = _cell(html, "Dokumento Nr.")
         if number:
             meta["dokumento_nr"] = number
-        adopted_by = _cell(html, "Priėmė")
         if adopted_by:
             meta["prieme"] = adopted_by
         registration = _cell(html, "Registravimo duomenys")
         if registration:
             meta["registravimo_duomenys"] = registration
         meta["paskelbta_leidinys"] = published_match.group("medium").strip()
-        meta["paskelbta_nr"] = published_match.group("number")
+        # some records gazette a date without an issue number (probed
+        # 2001-03: "TAR, 2001-03-12" — municipal appeal resolution)
+        if published_match.group("number"):
+            meta["paskelbta_nr"] = published_match.group("number")
         consolidation = _cell(html, "Galiojanti suvestinė redakcija")
         if consolidation and consolidation != "Nėra":
             meta["galiojanti_suvestine"] = _tidy(consolidation)

@@ -62,6 +62,7 @@ from adapters.base import SourceDefinition, TaskSeed
 __all__ = [
     "API_BASE",
     "CURSOR_KEY",
+    "PAGE_CAP",
     "PAGE_SIZE",
     "PORTAL_BASE",
     "SCOPE_PRESETS",
@@ -75,6 +76,9 @@ API_BASE = "https://www.lrs.lt/pls/inter3"
 PORTAL_BASE = "https://e-seimas.lrs.lt"
 #: Rows per result page of the legacy search (probed 2026-09-15).
 PAGE_SIZE = 30
+#: Rows the legacy endpoint will serve for one query window (17 pages;
+#: page 18+ answer 200 with the true total but no rows — probed 2026-09-21).
+PAGE_CAP = 17 * PAGE_SIZE
 
 CURSOR_KEY = "tad_last_date"
 
@@ -82,10 +86,19 @@ CURSOR_KEY = "tad_last_date"
 #: The legacy search takes a single p_drus per request (repeated values
 #: are silently narrowed to one — probed 2026-09-15, sample 17), so one
 #: seed per type code. p_org "" means "any issuer".
+#:
+#: Issuer filtering happens at the *detail* layer, not via the search's
+#: p_org parameter: the org-filtered index has holes (probed 2026-09-15:
+#: June 2018 answers 0 government resolutions with p_org=2 while the
+#: unfiltered type-31 query carries 173, sample 28) — the type code is
+#: reliable, the org filter is not. The type code itself is inherent
+#: (29 = presidential decrees, 31 = resolutions multi-issuer → the
+#: doc handler keeps only Vyriausybė-adopted ones for the resolutions
+#: scope, ESP origen precedent).
 SCOPE_PRESETS: dict[str, tuple[tuple[str, str], ...]] = {
     "laws": (("", "1"), ("", "10"), ("", "8"), ("", "173"), ("", "250")),
-    "decrees": (("3", "29"),),
-    "resolutions": (("2", "31"),),
+    "decrees": (("", "29"),),
+    "resolutions": (("", "31"),),
     # Ministerial orders, single type code, any issuer (the ministries
     # dominate; probed 2026-09-15: 474 in June 2024 across issuers, page
     # rows uniformly Įsakymas — the filter is clean; earlier "0 hits"
@@ -142,9 +155,29 @@ def _parse_scope(raw: str) -> list[tuple[str, str, str]]:
     return slices
 
 
+def _month_windows(from_date: date, to_date: date) -> list[tuple[date, date]]:
+    """Split [from, to] into calendar-month windows clipped at both ends
+    (backfill mode: one enumeration per month × slice, ~7.6k requests
+    saved over per-day at 2000-2026 scale)."""
+    windows: list[tuple[date, date]] = []
+    cursor = from_date
+    while cursor <= to_date:
+        if cursor.month == 12:
+            next_month = date(cursor.year + 1, 1, 1)
+        else:
+            next_month = date(cursor.year, cursor.month + 1, 1)
+        window_end = min(to_date, next_month - timedelta(days=1))
+        windows.append((cursor, window_end))
+        cursor = next_month
+    return windows
+
+
 def start_tasks(params: dict[str, Any]) -> list[TaskSeed]:
     is_sync = str(params.get("sync", "")).strip() in ("1", "true", "yes")
     slices = _parse_scope(str(params.get("scope", ",".join(SCOPE_PRESETS))))
+    granularity = str(params.get("granularity", "day")).strip().lower()
+    if granularity not in ("day", "month"):
+        raise _fail(f"granularity must be day or month (got {granularity!r})")
 
     if params.get("window"):
         window = str(params["window"])
@@ -156,6 +189,8 @@ def start_tasks(params: dict[str, Any]) -> list[TaskSeed]:
         if from_date > to_date:
             raise _fail(f"window start {from_date} is after its end {to_date}")
     elif is_sync:
+        if granularity == "month":
+            raise _fail("sync=1 runs per-day; use granularity=day (default) with sync=1")
         kv = params.get("_kv", {})
         cursor = kv.get(CURSOR_KEY)
         if not cursor:
@@ -170,24 +205,34 @@ def start_tasks(params: dict[str, Any]) -> list[TaskSeed]:
     else:
         raise _fail("give window=FROM:TO or sync=1")
 
+    if granularity == "month":
+        windows: list[tuple[date, date]] = _month_windows(from_date, to_date)
+    else:
+        windows = [(d, d) for d in _days(from_date, to_date)]
+
     seeds: list[TaskSeed] = []
+    for window_from, window_to in windows:
+        for scope_name, org, drus in slices:
+            seed_params: dict[str, str] = {
+                "date": window_from.isoformat(),
+                "org": org,
+                "drus": drus,
+                "page": "1",
+                "scope": scope_name,
+            }
+            if window_to != window_from:
+                seed_params["to"] = window_to.isoformat()
+            seeds.append(TaskSeed(type="tad_list", params=seed_params))
+    return seeds
+
+
+def _days(from_date: date, to_date: date) -> list[date]:
+    out: list[date] = []
     day = from_date
     while day <= to_date:
-        for scope_name, org, drus in slices:
-            seeds.append(
-                TaskSeed(
-                    type="tad_list",
-                    params={
-                        "date": day.isoformat(),
-                        "org": org,
-                        "drus": drus,
-                        "page": "1",
-                        "scope": scope_name,
-                    },
-                )
-            )
+        out.append(day)
         day += timedelta(days=1)
-    return seeds
+    return out
 
 
 def build_source() -> SourceDefinition:
@@ -198,6 +243,7 @@ def build_source() -> SourceDefinition:
     return SourceDefinition(
         name="tad",
         start_tasks=start_tasks,
+        parallel_safe=True,  # stateless GETs end to end; session-free
         task_types={
             "tad_list": TadListHandler(),
             "tad_doc": TadDocHandler(),
