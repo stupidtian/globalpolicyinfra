@@ -323,4 +323,13 @@ def build_source() -> SourceDefinition:
         """,
         domain_tables=("laws", "doc_texts"),
         domain_keys={"laws": ("law_key",), "doc_texts": ("doc_id",)},
+        # Framework-concurrency ruling 1.4: the declaration is the pack's to
+        # make, on evidence. Every channel here is stateless — probed
+        # 2026-09-15/16: no cookies, no CSRF, no tokens (documentsearch and
+        # the XML/POST/timeline channels answer plain requests; the POST body
+        # is a constant ``{}``), and the harvest API (the only rate-capped
+        # surface, 10 s) is not part of the backfill chain. Handlers are pure
+        # functions with no shared state, so worker threads share nothing
+        # beyond the framework's own transport/ledger machinery.
+        parallel_safe=True,
     )
