@@ -106,14 +106,24 @@ class KorBodyHandler:
         text = response.content.decode("utf-8", errors="replace")
 
         if "pgroup" not in text:
-            # Probed in production (2026-08-31): very old historical versions
-            # (e.g. 1963) return an HTTP-200 apology page with no articles.
-            # For timeline-discovered versions that is a data boundary — skip
-            # gracefully; for a list anchor it is a shape change — escalate.
-            if params.get("from_versions") and ("죄송" in text or "불편" in text):
+            # Probed in production (2026-08-31/09-16/09-18): many historical
+            # versions are not served by the body endpoint — an HTTP-200
+            # apology page (very old versions, e.g. 1963), a 441-byte "XML
+            # 파싱중 오류 발생" alert page, or an HTTP 404. Recognition is by
+            # the site's own error signatures (죄송/오류) so it works for
+            # tasks enqueued before the tagging existed; tagged tasks
+            # (from_versions/from_hist) also skip on unknown unserved shapes.
+            # A current-list anchor with an unrecognized empty shape is still
+            # a shape change — escalate.
+            known_error_page = "죄송" in text or "오류" in text
+            tagged_historical = bool(
+                params.get("from_versions") or params.get("from_hist")
+            )
+            if "lsId" not in text and (known_error_page or tagged_historical):
                 return TaskResult(
                     expected_empty=f"historical version {seq}/{ef_yd} is not served "
-                    "by the body endpoint (site apology page)"
+                    "by the body endpoint (site error page)",
+                    next_tasks=[TaskSeed(type="kor_reason", params={"seq": seq, "ef_yd": ef_yd})],
                 )
             raise ValueError(f"body of {seq}/{ef_yd} carries no article groups")
 
@@ -132,20 +142,25 @@ class KorBodyHandler:
         if ct_sub is None:
             raise ValueError(f"body of {seq}/{ef_yd} carries no ct_sub publication line")
         pub = parse_pubinfo(html_mod.unescape(_strip_tags(ct_sub.group(1))))
-        if not pub.get("effective_date"):
-            raise ValueError(f"body of {seq}/{ef_yd} has an unparsable 시행 date")
 
+        # Probed 2026-09-17: "시행 미정" (effective date undetermined; the
+        # list shows the 99990101 placeholder) parses no effective date but
+        # still carries the promulgation date — take that; fall back further
+        # to the task's ef_yd only if even the promulgation date is absent.
         publication_date = pub.get("promulgation_date") or ""
         fallback = False
         if not publication_date:
-            publication_date = pub["effective_date"]
+            publication_date = pub.get("effective_date", "")
+            fallback = True
+        if not publication_date and len(ef_yd) == 8 and ef_yd.isdigit():
+            publication_date = f"{ef_yd[:4]}-{ef_yd[4:6]}-{ef_yd[6:8]}"
             fallback = True
 
         meta: dict[str, str] = {
             "lsi_seq": seq,
             "ef_yd": ef_yd,
             "ls_id": ls_id.group(1),
-            "effective_date": pub["effective_date"],
+            "effective_date": pub.get("effective_date", ""),
             "effective_raw": pub.get("effective_raw", ""),
             "amendment_type": pub.get("amendment_type", ""),
         }

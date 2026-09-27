@@ -44,6 +44,11 @@ _ROW_RE = re.compile(
 
 
 class KorListHandler:
+    #: The list task type this handler spawns for walk continuation; the
+    #: historical-corpus subclass (kor_hist_list) overrides both this and
+    #: build_request — the row shape and anchor logic are identical.
+    _SPAWN_TYPE = "kor_list"
+
     def build_request(self, task: TaskView) -> RequestSpec:
         return RequestSpec(
             url=f"{BASE_URL}/lsScListR.do",
@@ -90,7 +95,7 @@ class KorListHandler:
         if full_page and not capped and params.get("walk"):
             next_tasks.append(
                 TaskSeed(
-                    type="kor_list",
+                    type=self._SPAWN_TYPE,
                     params={**params, "pg": pg + 1},
                     signal=task.signal,  # a refresh re-walk must reach every page
                 )

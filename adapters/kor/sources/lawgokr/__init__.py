@@ -194,6 +194,11 @@ def _parse_pages(raw: str) -> list[int] | str:
 
 
 def start_tasks(params: dict[str, Any]) -> list[TaskSeed]:
+    # Historical-corpus walk (phase 2): hist_pages selects the 연혁 discovery
+    # layer instead of the current list; the two modes are mutually exclusive.
+    if str(params.get("hist_pages", "")).strip():
+        return _hist_seeds(params)
+
     raw_pages = str(params.get("pages", "")).strip()
     if not raw_pages:
         raise _fail("pages is required")
@@ -238,6 +243,45 @@ def start_tasks(params: dict[str, Any]) -> list[TaskSeed]:
     return seeds
 
 
+def _hist_seeds(params: dict[str, Any]) -> list[TaskSeed]:
+    """Historical-corpus list seeds (연혁, the discovery layer for repealed
+    laws). ``hist_pages`` mirrors ``pages``; versions already fetched by the
+    current-law pass dedup by task_id, so the walk re-fetches only what is
+    genuinely new (repealed laws' versions)."""
+    raw = str(params.get("hist_pages", "")).strip()
+    if not raw:
+        raise _fail("hist_pages is required for the historical-corpus walk")
+    pages = _parse_pages(raw)
+    max_laws: int | None = None
+    raw_max = str(params.get("max_laws", "")).strip()
+    if raw_max:
+        max_laws = int(raw_max)
+    if pages == "all":
+        seeds = [TaskSeed(type="kor_hist_list", params={"pg": 1, "walk": 1})]
+    else:
+        seeds = [TaskSeed(type="kor_hist_list", params={"pg": pg}) for pg in pages]
+    if max_laws is not None:
+        seeds = [
+            TaskSeed(type=seed.type, params={**seed.params, "max_laws": max_laws})
+            for seed in seeds
+        ]
+    min_ef = str(params.get("min_ef", "")).strip()
+    if min_ef:
+        if not _valid_yyyymmdd(min_ef):
+            raise _fail("min_ef must look like YYYYMMDD, e.g. 20000101")
+        seeds = [
+            TaskSeed(type=seed.type, params={**seed.params, "min_ef": min_ef})
+            for seed in seeds
+        ]
+    return seeds
+
+
+def _valid_yyyymmdd(raw: str) -> bool:
+    import re as _re
+
+    return bool(_re.fullmatch(r"\d{8}", raw))
+
+
 def _iso_timestamp(raw: str) -> str | None:
     import re as _re
 
@@ -265,7 +309,10 @@ CREATE TABLE IF NOT EXISTS laws (
 
 
 def build_source() -> SourceDefinition:
+    from adapters.base import CleanDefinition
     from adapters.kor.sources.lawgokr.body import KorBodyHandler
+    from adapters.kor.sources.lawgokr.clean import CLEAN_VERSION, LawgokrCleanHandler
+    from adapters.kor.sources.lawgokr.hist_list import KorHistListHandler
     from adapters.kor.sources.lawgokr.list import KorListHandler
     from adapters.kor.sources.lawgokr.reason import KorReasonHandler
     from adapters.kor.sources.lawgokr.versions import KorVersionsHandler
@@ -275,11 +322,24 @@ def build_source() -> SourceDefinition:
         start_tasks=start_tasks,
         task_types={
             "kor_list": KorListHandler(),
+            "kor_hist_list": KorHistListHandler(),
             "kor_body": KorBodyHandler(),
             "kor_versions": KorVersionsHandler(),
             "kor_reason": KorReasonHandler(),
+            "lawgokr_clean": LawgokrCleanHandler(),
         },
+        # Body container rules probed across 5 decades of page shapes
+        # (docs/tasks/2026-08-28-kor/clean-probe/); version bumps re-clean.
+        clean=CleanDefinition(
+            task_type="lawgokr_clean",
+            version=CLEAN_VERSION,
+            targets=("kor_body", "kor_reason"),
+        ),
         domain_schema=DOMAIN_SCHEMA,
         domain_tables=("laws",),
         domain_keys={"laws": ("ls_id",)},
+        # law.go.kr is stateless GETs — no cookies, no csrf, no cross-task
+        # transport state (probed 2026-08-29/30) — safe on any worker with
+        # any session (framework-concurrency ruling 1.4).
+        parallel_safe=True,
     )

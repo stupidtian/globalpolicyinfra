@@ -75,4 +75,12 @@ class KorVersionsHandler:
                 )
             )
             next_tasks.append(TaskSeed(type="kor_reason", params={"seq": seq, "ef_yd": ef_yd}))
+        if not next_tasks:
+            # A never-amended law: the timeline holds only the spawning
+            # version's own row(s). Nothing historical to spawn — a normal
+            # shape (observed in production, ~10% of laws), not a failure.
+            return TaskResult(
+                expected_empty=f"law {task.params['seq']}/{task.params['ef_yd']} has no "
+                "historical versions (never amended)"
+            )
         return TaskResult(next_tasks=next_tasks)
