@@ -109,6 +109,20 @@ class HttpTransport:
                 )
             params[spec.key_param] = key
 
+        headers = dict(spec.headers or {})
+        if spec.key_header:
+            # Header-channel key injection (framework-pdf-cleaning 2026-09-28,
+            # first consumer MinerU): same discipline as key_param — the env
+            # var's NAME rides in the spec, the value is read here, at the
+            # last moment, and travels only in the request header.
+            token = os.environ.get(spec.key_header, "").strip()
+            if not token:
+                raise PermanentError(
+                    f"{spec.key_header} is not set. Put it in the repository .env "
+                    "(see .env.example)."
+                )
+            headers["Authorization"] = f"Bearer {token}"
+
         url = spec.url
         session = self.session()
         method = (spec.method or "GET").upper()
@@ -120,7 +134,7 @@ class HttpTransport:
                     response = session.get(
                         url,
                         params=params or None,
-                        headers=spec.headers or None,
+                        headers=headers or None,
                         timeout=self.timeout,
                     )
                 elif method == "POST":
@@ -131,7 +145,7 @@ class HttpTransport:
                         url,
                         params=params or None,
                         json=spec.json_body,
-                        headers=spec.headers or None,
+                        headers=headers or None,
                         timeout=self.timeout,
                     )
                 else:

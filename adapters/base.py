@@ -23,7 +23,10 @@ from core.document import DocumentRecord
 
 __all__ = [
     "BROWSER_ACTIONS",
+    "CleanDefinition",
+    "CleanedRecord",
     "FileOut",
+    "PdfRule",
     "ReplaceRows",
     "RequestSpec",
     "Response",
@@ -91,9 +94,24 @@ class RequestSpec:
     consumer DNK retsinformation): HTTP method of the single request —
     "GET" (default, semantics untouched) or "POST" — and for POST the JSON
     request body (``None`` = bodyless POST).
+
+    ``local_doc`` (2026-09-19, framework-cleaning): read a local file
+    instead of the network — the value is a ``doc_id``; the engine resolves
+    it through ``documents.local_path`` (``.gz`` suffix is decompressed
+    automatically) and hands the bytes to ``parse`` as a 200 Response. No
+    HTTP transport involved: no ``--delay`` pacing, no session, runs with
+    transport=None. ``local_doc`` set means ``url`` is ignored; both empty
+    is a loud engine error.
+
+    ``key_header`` (2026-09-28, framework-pdf-cleaning; first consumer
+    MinerU): the environment variable holding the API token, injected by
+    the transport as an ``Authorization: Bearer <value>`` request header.
+    Same discipline as ``key_env``: only the variable's NAME travels here —
+    the value is read at the last moment and never enters params, the
+    ledger, or logs.
     """
 
-    url: str
+    url: str = ""
     params: dict[str, Any] = field(default_factory=dict)
     headers: dict[str, str] = field(default_factory=dict)
     key_env: str | None = None
@@ -103,6 +121,8 @@ class RequestSpec:
     accept_not_found: bool = False
     method: str = "GET"
     json_body: dict[str, Any] | None = None
+    local_doc: str | None = None
+    key_header: str | None = None
 
 
 @dataclass(frozen=True)
@@ -144,6 +164,21 @@ class ReplaceRows:
     rows: list[dict[str, Any]]
 
 
+@dataclass(frozen=True)
+class CleanedRecord:
+    """One document's cleaned plain text (framework-cleaning 2026-09-19).
+
+    The framework — never the country pack — derives the on-disk path
+    (``02_cleaned/{sha256(doc_id)[:2]}/{doc_id}.txt``) and the ledger row.
+    ``content`` must be deterministic UTF-8 text: ``\\n`` line breaks only,
+    no BOM, exactly one trailing newline; the engine enforces this loudly.
+    """
+
+    doc_id: str
+    version: int
+    content: bytes
+
+
 @dataclass
 class TaskResult:
     """Everything one task yielded. All fields optional; a result with all
@@ -157,6 +192,7 @@ class TaskResult:
     files: list[FileOut] = field(default_factory=list)
     next_tasks: list[TaskSeed] = field(default_factory=list)
     cursor_updates: dict[str, str] = field(default_factory=dict)
+    cleaned: list[CleanedRecord] = field(default_factory=list)
     expected_empty: str | None = None
 
     def is_empty(self) -> bool:
@@ -166,6 +202,7 @@ class TaskResult:
             or self.documents
             or self.files
             or self.next_tasks
+            or self.cleaned
         )
 
 
@@ -176,6 +213,57 @@ class TaskHandler(Protocol):
     def build_request(self, task: TaskView) -> RequestSpec: ...
 
     def parse(self, response: Response, task: TaskView) -> TaskResult: ...
+
+
+@dataclass(frozen=True)
+class CleanDefinition:
+    """A source's cleaning declaration (framework-cleaning 2026-09-19).
+
+    The clean task type's handler is registered in ``task_types`` like any
+    other; its ``build_request`` returns ``RequestSpec(local_doc=doc_id)``
+    and its ``parse`` produces ``TaskResult.cleaned``. Seeding params are
+    ``{doc_id, v, kind}`` — never a file path (task_id identity).
+
+    ``version`` is the cleaning-rule version: bumping it reseeds everything
+    (``v`` rides in params → new task ids), old task rows are left alone —
+    the same parameterized-reopen family as collection signals (§6.5).
+
+    ``pdf_rules`` (framework-pdf-cleaning 2026-09-28): ordered routing
+    table for PDF documents — the FIRST rule whose feature window contains
+    the measured value wins; its ``channel`` is "geometry" (local
+    pdfminer.six extraction) or "mineru" (MinerU network interface). No
+    match with rules declared → the shape is escalated (needs_agent, loud);
+    no rules at all → every PDF goes to geometry. Routing is fixed
+    framework code over this declaration — zero runtime intelligence.
+    """
+
+    task_type: str
+    version: int
+    targets: tuple[str, ...]  # producing task types whose docs are cleanable
+    pdf_rules: tuple[PdfRule, ...] = ()
+
+
+@dataclass(frozen=True)
+class PdfRule:
+    """One row of a PDF routing table (framework-pdf-cleaning 2026-09-28):
+    route to ``channel`` when ``lo <= measure_pdf()[feature] <= hi``.
+
+    ``None`` bounds are open; ``feature`` must be a ``measure_pdf`` output
+    key (pages / chars / text_coverage / columns / vertical_share /
+    image_coverage / cjk_share). ``channel`` is "geometry" or "mineru" —
+    anything else fails at construction (declaration bugs die at import,
+    not at 3 a.m. in a backfill)."""
+
+    feature: str
+    lo: float | None = None
+    hi: float | None = None
+    channel: str = "geometry"
+
+    def __post_init__(self) -> None:
+        if self.channel not in ("geometry", "mineru"):
+            raise ValueError(
+                f"PdfRule channel must be 'geometry' or 'mineru', got {self.channel!r}"
+            )
 
 
 @dataclass(frozen=True)
@@ -193,6 +281,10 @@ class SourceDefinition:
     sources declaring True can use ``--workers >= 2``; the engine auto-caps
     undeclared sources to one worker with a warning, so session-bound
     sources (e.g. German-style session chains) can never be hurt.
+
+    ``clean`` (framework-cleaning 2026-09-19): declares this source's
+    cleaning task type and rule version; ``None`` (default) = the source
+    has no cleaning, behavior unchanged.
     """
 
     name: str
@@ -202,3 +294,4 @@ class SourceDefinition:
     domain_tables: tuple[str, ...] = ()  # for status counting / inspection
     domain_keys: dict[str, tuple[str, ...]] = field(default_factory=dict)
     parallel_safe: bool = False
+    clean: CleanDefinition | None = None

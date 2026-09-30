@@ -17,7 +17,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from __version__ import __version__
-from adapters.base import SourceDefinition, TaskSeed
+from adapters.base import CleanDefinition, SourceDefinition, TaskSeed
 from adapters.registry import RegistryError, discover, get_source
 from core import paths
 from core.config import (
@@ -28,6 +28,8 @@ from core.config import (
 )
 from runtime.engine import TaskEngine
 from runtime.proclock import CollectLock, LockBusyError
+from runtime.stages import pdf_mineru
+from runtime.stages.pdf_clean import PdfCleanHandler
 from runtime.transport.http import HttpTransport
 from store.index_io import write_index
 from store.state_store import StateStore
@@ -109,6 +111,15 @@ def build_parser() -> argparse.ArgumentParser:
         "before a full run)",
     )
     clean_parser.add_argument(
+        "--api-pages", type=int, default=None, metavar="N",
+        help="Daily page budget for the MinerU network channel (opt-in "
+        "throttling; default unlimited — the service's soft quota just "
+        "degrades priority past 1000 pages/day). Documents routed to "
+        "MinerU beyond the budget stay deferred and are reseeded by the "
+        "next run; the local geometry channel is never throttled. "
+        "Runtime-only — never stored in task params or the ledger",
+    )
+    clean_parser.add_argument(
         "--dry-run", action="store_true",
         help="Show what would be seeded and what is already due; nothing enqueued or cleaned",
     )
@@ -182,6 +193,21 @@ def build_parser() -> argparse.ArgumentParser:
         help="Execute the plan (default: dry run)",
     )
     layout_parser.add_argument(
+        "--config-file", default=None,
+        help="Explicit config file location (default: ~/.globalpolicyinfra/config.toml).",
+    )
+
+    dnk_mainfile_parser = subparsers.add_parser(
+        "repair-dnk-mainfile",
+        help="One-time DNK repair: point documents.local_path at the full-text "
+        "carrier (text.html for stub-era docs; clean-probe/clean-plan.md).",
+    )
+    dnk_mainfile_parser.add_argument("--country", default="dnk", help="ISO3 code (dnk)")
+    dnk_mainfile_parser.add_argument(
+        "--apply", action="store_true",
+        help="Execute the repair (default: dry run)",
+    )
+    dnk_mainfile_parser.add_argument(
         "--config-file", default=None,
         help="Explicit config file location (default: ~/.globalpolicyinfra/config.toml).",
     )
@@ -334,10 +360,19 @@ def _run_clean(args: argparse.Namespace) -> int:
     """``clean`` (framework-cleaning 2.5): seed cleaning tasks from the
     declarations, then run them through the engine with a narrowed type
     set. Local reads only. Lock/exit codes align with collect (same lock
-    file, busy=3, dry-run never locks)."""
+    file, busy=3, dry-run never locks).
+
+    PDF sources (framework-pdf-cleaning): the reseed threshold is
+    ``v*100`` (cleaned.version carries the MinerU backend fingerprint in
+    its low two digits), the seed carries a date ``signal`` so budget-
+    deferred docs reopen the next day, and the narrowed type set includes
+    the MinerU chain types."""
     country = args.country.upper()
     if args.limit is not None and args.limit < 1:
         print("error: --limit must be >= 1", file=sys.stderr)
+        return 2
+    if args.api_pages is not None and args.api_pages < 0:
+        print("error: --api-pages must be >= 0", file=sys.stderr)
         return 2
     try:
         data_root = resolve_data_root(config_path=args.config_file)
@@ -392,10 +427,12 @@ def _run_clean(args: argparse.Namespace) -> int:
                 union_types: set[str] = set()
                 for source, decl in decls:
                     assert decl is not None
-                    pairs = store.clean_pending_targets(decl.targets, decl.version)
+                    pairs = store.clean_pending_targets(
+                        decl.targets, _clean_version_threshold(source, decl)
+                    )
                     if args.limit is not None:
                         pairs = pairs[: args.limit]
-                    union_types.add(decl.task_type)
+                    union_types.update(_clean_run_types(source, decl))
                     print(
                         f"  [{source.name}] would seed {len(pairs)} "
                         f"{decl.task_type} task(s) at v={decl.version}"
@@ -407,9 +444,21 @@ def _run_clean(args: argparse.Namespace) -> int:
                 due = store.iter_due_tasks(types=union_types)
                 print(f"  clean tasks already due in ledger: {len(due)}")
                 return 0
+            today = datetime.now(UTC).strftime("%Y-%m-%d")
             for source, decl in decls:
                 assert decl is not None
-                pairs = store.clean_pending_targets(decl.targets, decl.version)
+                pdf_channel = _is_pdf_clean(source, decl)
+                pdf_mineru.configure_pages(
+                    budget=args.api_pages,
+                    used=(
+                        int(store.kv_get(f"mineru_pages_used_{today}") or 0)
+                        if args.api_pages is not None
+                        else 0
+                    ),
+                )
+                pairs = store.clean_pending_targets(
+                    decl.targets, _clean_version_threshold(source, decl)
+                )
                 if args.limit is not None:
                     pairs = pairs[: args.limit]
                 seeded = 0
@@ -418,6 +467,10 @@ def _run_clean(args: argparse.Namespace) -> int:
                         TaskSeed(
                             type=decl.task_type,
                             params={"doc_id": doc_id, "v": decl.version, "kind": kind},
+                            # Fresh per-day signal: docs deferred by the API
+                            # page budget finish "done (expected_empty)" and
+                            # are reopened by the next day's seed (plan ④).
+                            signal=today,
                         )
                     )
                     seeded += 1 if changed else 0
@@ -428,16 +481,51 @@ def _run_clean(args: argparse.Namespace) -> int:
                         f"seeded {seeded} {decl.task_type} tasks (v={decl.version})",
                     )
                 engine = TaskEngine(store, data_root, country, source, None)
-                report = engine.run_cleaning({decl.task_type})
+                report = engine.run_cleaning(_clean_run_types(source, decl))
+                if pdf_channel and args.api_pages is not None:
+                    store.kv_set(
+                        f"mineru_pages_used_{today}",
+                        str(pdf_mineru.pages_reserved()),
+                    )
                 print(f"[{country}/{source.name}] clean finished")
                 for line in report.summary_lines():
                     print(f"  {line}")
                 for key in sorted(report.detail):
                     print(f"  {key}: {report.detail[key]}")
+                if pdf_channel and pdf_mineru.deferred_count():
+                    print(
+                        f"  api page budget: {pdf_mineru.pages_reserved()} page(s) "
+                        f"reserved, {pdf_mineru.deferred_count()} document(s) "
+                        "deferred to the next run"
+                    )
     finally:
         if lock is not None:
             lock.release()
     return 0
+
+
+def _is_pdf_clean(source: SourceDefinition, decl: CleanDefinition) -> bool:
+    """True when the declared clean task type is the framework PDF router
+    (its ledger versions carry the ×100 fingerprint encoding)."""
+    handler = source.task_types.get(decl.task_type)
+    return isinstance(handler, PdfCleanHandler)
+
+
+def _clean_version_threshold(source: SourceDefinition, decl: CleanDefinition) -> int:
+    """Reseed scan threshold: PDF sources store ``v*100 + fingerprint``
+    (plan Q3), HTML sources keep the bare version."""
+    return decl.version * 100 if _is_pdf_clean(source, decl) else decl.version
+
+
+def _clean_run_types(source: SourceDefinition, decl: CleanDefinition) -> set[str]:
+    """Narrowed fetch set for one clean run: the declared type plus, for
+    PDF sources, the MinerU chain types the router may derive."""
+    types = {decl.task_type}
+    if _is_pdf_clean(source, decl):
+        types.update(
+            (pdf_mineru.SUBMIT_TYPE, pdf_mineru.POLL_TYPE, pdf_mineru.FETCH_TYPE)
+        )
+    return types
 
 
 def _run_status(args: argparse.Namespace) -> int:
@@ -719,6 +807,93 @@ def _run_migrate_layout(args: argparse.Namespace) -> int:
         return 0
 
 
+# -- repair-dnk-mainfile (one-time, DNK 2026-09-29 mainfile/carrier alignment) ----------
+#
+# DEVIATION (same family as migrate-layout): bulk documents-row UPDATE outside the
+# write_batch path, per clean-plan.md. Idempotent (rows already pointing at their
+# text.html match nothing on a second run), one transaction, an events row records
+# the application. Scope: documents rows that have a doc_texts entry (the stub-era
+# full-text sibling) and whose local_path still ends in doc.xml. After the repair
+# the ledger's main-file pointer IS the full-text carrier for every document, so
+# clean seeding (local_doc) reads the real text. doc_id is untouched (it hashes
+# source_url, not paths); the old doc.xml path moves into meta.files.
+
+def _run_repair_dnk_mainfile(args: argparse.Namespace) -> int:
+    import hashlib
+    import json as _json
+    from datetime import UTC as _UTC
+    from datetime import datetime as _dt
+
+    try:
+        data_root = resolve_data_root(config_path=args.config_file)
+    except ConfigError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    country = args.country.upper()
+    country_root = paths.country_dir(data_root, country)
+    with StateStore.for_country(data_root, country) as store:
+        conn = store.connection
+        rows = conn.execute(
+            "SELECT d.doc_id, d.local_path, d.meta, t.text_path "
+            "FROM documents d JOIN doc_texts t ON t.doc_id = d.doc_id "
+            "WHERE d.local_path LIKE '%/doc.xml'"
+        ).fetchall()
+        plan: list[tuple[str, str, str, str | None]] = []
+        skipped_missing_disk = 0
+        for row in rows:
+            target = country_root / row["text_path"]
+            if not target.exists():
+                skipped_missing_disk += 1
+                continue
+            plan.append((row["doc_id"], row["local_path"], row["text_path"], row["meta"]))
+        print(f"[{country}] mainfile repair plan: {len(plan)} row(s) -> text.html carrier"
+              + (f" ({skipped_missing_disk} skipped: text file missing on disk)" if skipped_missing_disk else ""))
+        for doc_id, _old, new, _meta in plan[:3]:
+            print(f"  e.g. {doc_id}: {_old} -> {new}")
+        if not plan:
+            print("  nothing to do (already repaired)")
+            return 0
+        if not args.apply:
+            print("dry run — pass --apply to execute")
+            return 0
+
+        with store.transaction() as tx:
+            for doc_id, old_path, text_path, meta_json in plan:
+                data = (country_root / text_path).read_bytes()
+                meta: dict[str, str] = _json.loads(meta_json) if meta_json else {}
+                siblings = meta.get("files")
+                # merge, never overwrite: keep any already-recorded siblings
+                if siblings and "doc.xml" not in siblings:
+                    meta["files"] = f"{siblings};doc.xml"
+                else:
+                    meta["files"] = "doc.xml"
+                tx.execute(
+                    "UPDATE documents SET local_path = ?, file_hash = ?, "
+                    "content_length = ?, raw_format = 'html', meta = ? "
+                    "WHERE doc_id = ?",
+                    (
+                        text_path,
+                        hashlib.sha256(data).hexdigest(),
+                        len(data),
+                        _json.dumps(meta, ensure_ascii=False, sort_keys=True),
+                        doc_id,
+                    ),
+                )
+            tx.execute(
+                "INSERT INTO events (ts, entity_type, subject_id, stage, "
+                "from_status, to_status, detail) VALUES (?, 'documents', "
+                "'repair-dnk-mainfile', NULL, NULL, 'applied', ?)",
+                (
+                    _dt.now(_UTC).isoformat().replace("+00:00", "Z"),
+                    f"main-file pointer -> text.html on {len(plan)} stub-era rows "
+                    + "(doc.xml kept as meta.files sibling; see clean-plan.md)",
+                ),
+            )
+        print(f"[{country}] mainfile repair applied: {len(plan)} row(s) rewritten "
+              "in one transaction")
+        return 0
+
+
 def _run_events_archive(args: argparse.Namespace) -> int:
     try:
         data_root = resolve_data_root(config_path=args.config_file)
@@ -775,6 +950,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         return _run_repair_documents(args)
     if args.command == "migrate-layout":
         return _run_migrate_layout(args)
+    if args.command == "repair-dnk-mainfile":
+        return _run_repair_dnk_mainfile(args)
     if args.command == "events-archive":
         return _run_events_archive(args)
     parser.print_help()
