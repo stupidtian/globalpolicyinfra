@@ -50,6 +50,7 @@ CREATE TABLE IF NOT EXISTS tasks (
     updated_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_tasks_due ON tasks(status, next_attempt_at);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_tasks_identity ON tasks(type, params);
 
 CREATE TABLE IF NOT EXISTS documents (
     doc_id TEXT PRIMARY KEY,
@@ -187,48 +188,52 @@ class StateStore:
     def enqueue(self, seed: TaskSeed) -> tuple[str, bool]:
         """Enqueue one task. Returns ``(task_id, changed)``.
 
-        Dedup/reopen semantics (section 6.5): the same type+params always
-        maps to the same task_id. A new seed for a pending/retry task only
-        refreshes its signal; for a done task it reopens it **iff** the seed
-        carries a newer signal (source-side update stamp); terminal-failed
-        tasks are left for the repair channel.
+        Identity is the ``(type, params)`` tuple (ruling 2026-09-30):
+        dedup/reopen look the row up **by tuple** and a UNIQUE index on
+        ``(type, params)`` makes "same work, one row" structural — a hash
+        collision can never swallow work again. The hash is demoted to a
+        door plate: a new tuple is inserted under ``{type}_{digest[:12]}``,
+        and when that plate is already taken the plate grows (16, then the
+        full 64) instead of the work being dropped.
+
+        Dedup/reopen semantics (section 6.5, unchanged): a new seed for a
+        pending/retry task only refreshes its signal; for a done task it
+        reopens it **iff** the seed carries a newer signal (source-side
+        update stamp); terminal-failed tasks are left for the repair
+        channel.
         """
-        task_id = compute_task_id(seed.type, seed.params)
         now = utc_now_iso()
         params_json = json.dumps(seed.params, ensure_ascii=False, sort_keys=True)
         with self.transaction() as conn:
             row = conn.execute(
-                "SELECT status, signal FROM tasks WHERE task_id = ?", (task_id,)
+                "SELECT task_id, status, signal FROM tasks WHERE type = ? AND params = ?",
+                (seed.type, params_json),
             ).fetchone()
-            if row is None:
-                conn.execute(
-                    "INSERT INTO tasks (task_id, type, params, status, signal, "
-                    "created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
-                    (task_id, seed.type, params_json, Status.PENDING.value,
-                     seed.signal, now, now),
-                )
-                _append_event(conn, now, "task", task_id, None, None,
-                              Status.PENDING.value, "task enqueued")
-                return task_id, True
-            status = Status(row["status"])
-            changed = False
-            if status in (Status.PENDING, Status.RETRY):
-                if seed.signal and (not row["signal"] or seed.signal > row["signal"]):
+            if row is not None:
+                status = Status(row["status"])
+                task_id = row["task_id"]
+                changed = False
+                if status in (Status.PENDING, Status.RETRY):
+                    if seed.signal and (not row["signal"] or seed.signal > row["signal"]):
+                        conn.execute(
+                            "UPDATE tasks SET signal = ?, updated_at = ? WHERE task_id = ?",
+                            (seed.signal, now, task_id),
+                        )
+                        changed = True
+                elif status is Status.DONE and seed.signal and (not row["signal"] or seed.signal > row["signal"]):
                     conn.execute(
-                        "UPDATE tasks SET signal = ?, updated_at = ? WHERE task_id = ?",
-                        (seed.signal, now, task_id),
+                        "UPDATE tasks SET status = ?, attempts = 0, last_error = NULL, "
+                        "next_attempt_at = NULL, signal = ?, updated_at = ? WHERE task_id = ?",
+                        (Status.PENDING.value, seed.signal, now, task_id),
                     )
+                    _append_event(conn, now, "task", task_id, None, Status.DONE.value,
+                                  Status.PENDING.value, "task reopened (newer signal)")
                     changed = True
-            elif status is Status.DONE and seed.signal and (not row["signal"] or seed.signal > row["signal"]):
-                conn.execute(
-                    "UPDATE tasks SET status = ?, attempts = 0, last_error = NULL, "
-                    "next_attempt_at = NULL, signal = ?, updated_at = ? WHERE task_id = ?",
-                    (Status.PENDING.value, seed.signal, now, task_id),
-                )
-                _append_event(conn, now, "task", task_id, None, Status.DONE.value,
-                              Status.PENDING.value, "task reopened (newer signal)")
-                changed = True
-        return task_id, changed
+                return task_id, changed
+            task_id = _insert_new_task(conn, seed, params_json, now)
+            _append_event(conn, now, "task", task_id, None, None,
+                          Status.PENDING.value, "task enqueued")
+            return task_id, True
 
     def get_task(self, task_id: str) -> dict[str, Any] | None:
         row = self._conn.execute(
@@ -471,14 +476,25 @@ class StateStore:
         return None if row is None else row["local_path"]
 
     def clean_pending_targets(
-        self, targets: Sequence[str], version: int
+        self, targets: Sequence[str], version: int, *,
+        clean_type: str | None = None,
     ) -> list[tuple[str, str]]:
         """doc_ids whose producing task type is in ``targets`` and which
         have no ``cleaned`` row at ``version`` or newer — the cleaning seed
         scan (framework-cleaning 2.5). Returns ``(doc_id, producing task
         type)`` pairs; params for the seeds are built by the caller as
         ``{doc_id, v, kind}`` (kind = the producing type, for parse
-        branching)."""
+        branching).
+
+        With ``clean_type`` (framework-task-identity 2.2) pairs whose clean
+        task of that type already exists **and is done** are excluded too:
+        expected_empty documents (done, no cleaned row) stop being re-seeded
+        on every run. A version bump changes the seed params — a new tuple —
+        so reseeding still fires (v semantics unchanged). Only meaningful
+        when ``version`` is the bare seed version (true for non-PDF
+        sources; PDF sources do not pass ``clean_type`` — their re-seeding
+        is the MinerU page-budget deferral channel, #37 plan ④).
+        """
         if not targets:
             return []
         placeholders = ", ".join("?" for _ in targets)
@@ -495,7 +511,34 @@ class StateStore:
             """,
             (*targets, version),
         ).fetchall()
-        return [(row["doc_id"], row["type"]) for row in rows]
+        pairs = [(row["doc_id"], row["type"]) for row in rows]
+        if clean_type is None:
+            return pairs
+        return self._without_done_clean_tasks(pairs, clean_type, version)
+
+    def _without_done_clean_tasks(
+        self, pairs: list[tuple[str, str]], clean_type: str, version: int
+    ) -> list[tuple[str, str]]:
+        """Drop pairs whose ``(clean_type, {doc_id, v, kind})`` task is
+        already done — chunked tuple lookups against the ledger."""
+        def seed_params(doc_id: str, kind: str) -> str:
+            return json.dumps(
+                {"doc_id": doc_id, "v": version, "kind": kind},
+                ensure_ascii=False, sort_keys=True,
+            )
+
+        done_params: set[str] = set()
+        for start in range(0, len(pairs), _QUERY_CHUNK):
+            chunk = pairs[start:start + _QUERY_CHUNK]
+            candidates = [seed_params(doc_id, kind) for doc_id, kind in chunk]
+            placeholders = ", ".join("?" for _ in candidates)
+            rows = self._conn.execute(
+                f"SELECT params FROM tasks WHERE type = ? AND status = ? "
+                f"AND params IN ({placeholders})",
+                (clean_type, Status.DONE.value, *candidates),
+            ).fetchall()
+            done_params.update(row["params"] for row in rows)
+        return [pair for pair in pairs if seed_params(*pair) not in done_params]
 
     def note_event(self, entity_type: str, subject_id: str, detail: str) -> None:
         """Append one audit event outside any task lifecycle — engine-level
@@ -664,14 +707,62 @@ class StateStore:
 
 # -- helpers --------------------------------------------------------------------------
 
+_PLATE_LENGTHS = (12, 16, 64)
+"""Door-plate ladder (ruling 2026-09-30 §0-5): the hash prefix never moves,
+only the taken length grows. The full 64-hex plate is unique per tuple, so
+the ladder always terminates."""
+
+_QUERY_CHUNK = 500
+"""Bound on one SQL IN(...) tuple batch (SQLite variable limits vary by build)."""
+
+
+def _insert_new_task(
+    conn: sqlite3.Connection, seed: TaskSeed, params_json: str, now: str
+) -> str:
+    """Insert a brand-new ``(type, params)`` tuple under a door plate,
+    taking a longer plate whenever the current one is already occupied.
+
+    The initial plate goes through the module-level :func:`compute_task_id`
+    (the mint seam tests can pin); the longer candidates are derived from
+    the real digest directly, so a pinned initial plate cannot deadlock the
+    ladder. Bounded: at most 1 + len(_PLATE_LENGTHS) candidates.
+    """
+    digest = hashlib.sha256(f"{seed.type}|{params_json}".encode()).hexdigest()
+    candidates = [compute_task_id(seed.type, seed.params)]
+    candidates.extend(f"{seed.type}_{digest[:n]}" for n in _PLATE_LENGTHS)
+    seen: set[str] = set()
+    for plate in candidates:
+        if plate in seen:
+            continue
+        seen.add(plate)
+        try:
+            conn.execute(
+                "INSERT INTO tasks (task_id, type, params, status, signal, "
+                "created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (plate, seed.type, params_json, Status.PENDING.value,
+                 seed.signal, now, now),
+            )
+        except sqlite3.IntegrityError:
+            continue  # plate taken by another tuple's row — take a longer one
+        return plate
+    raise RuntimeError(
+        f"door plate ladder exhausted for {seed.type} {params_json!r} — "
+        "unreachable: same tuples are deduped by lookup, different tuples "
+        "cannot collide on the full 64-hex digest"
+    )
+
 
 def compute_task_id(task_type: str, params: Mapping[str, Any]) -> str:
-    """§6.1: ``sha256(type + canonical(params))[:8]`` — the same work always
-    maps to the same id, so re-enqueueing dedups naturally."""
-    import hashlib
+    """Mint the *initial door plate*: ``{type}_{sha256(type|params)[:12]}``.
 
+    Semantics demoted (ruling 2026-09-30): task identity is the
+    ``(type, params)`` tuple, enforced by the tasks table's UNIQUE index —
+    this function no longer decides identity or dedup, it only mints the
+    starting plate that :meth:`StateStore.enqueue` inserts (and lengthens
+    when taken). Historical name kept for compatibility.
+    """
     canonical = json.dumps(dict(params), ensure_ascii=False, sort_keys=True)
-    digest = hashlib.sha256(f"{task_type}|{canonical}".encode()).hexdigest()[:8]
+    digest = hashlib.sha256(f"{task_type}|{canonical}".encode()).hexdigest()[:12]
     return f"{task_type}_{digest}"
 
 
