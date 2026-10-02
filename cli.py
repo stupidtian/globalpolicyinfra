@@ -428,7 +428,8 @@ def _run_clean(args: argparse.Namespace) -> int:
                 for source, decl in decls:
                     assert decl is not None
                     pairs = store.clean_pending_targets(
-                        decl.targets, _clean_version_threshold(source, decl)
+                        decl.targets, _clean_version_threshold(source, decl),
+                        clean_type=_clean_skip_type(source, decl),
                     )
                     if args.limit is not None:
                         pairs = pairs[: args.limit]
@@ -457,7 +458,8 @@ def _run_clean(args: argparse.Namespace) -> int:
                     ),
                 )
                 pairs = store.clean_pending_targets(
-                    decl.targets, _clean_version_threshold(source, decl)
+                    decl.targets, _clean_version_threshold(source, decl),
+                    clean_type=_clean_skip_type(source, decl),
                 )
                 if args.limit is not None:
                     pairs = pairs[: args.limit]
@@ -515,6 +517,16 @@ def _clean_version_threshold(source: SourceDefinition, decl: CleanDefinition) ->
     """Reseed scan threshold: PDF sources store ``v*100 + fingerprint``
     (plan Q3), HTML sources keep the bare version."""
     return decl.version * 100 if _is_pdf_clean(source, decl) else decl.version
+
+
+def _clean_skip_type(source: SourceDefinition, decl: CleanDefinition) -> str | None:
+    """Seeding done-skip scope (framework-task-identity 2.2, Q1 ruling):
+    non-PDF sources skip documents whose clean task is already done —
+    expected_empty documents stop being re-seeded every run. PDF sources
+    keep re-seeding: their done-expected_empty tasks are the MinerU
+    page-budget deferral channel, reopened by the next day's fresh signal
+    (framework-pdf-cleaning plan ④)."""
+    return None if _is_pdf_clean(source, decl) else decl.task_type
 
 
 def _clean_run_types(source: SourceDefinition, decl: CleanDefinition) -> set[str]:
