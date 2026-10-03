@@ -13,7 +13,11 @@ country's routing table branches on, and :func:`geometry_pdf_to_text` is
 the local geometry channel (pdfminer.six) — horizontal line assembly,
 vertical (Japanese tategaki) column assembly, cross-page header/footer
 removal. The MinerU network channel lives in
-:mod:`runtime.stages.pdf_mineru`.
+:mod:`runtime.stages.pdf_mineru`. EPUB (2026-10-02): :func:`epub_to_text`
+is a pure navigation shell — OCF container → OPF → spine — over the HTML
+engine (each spine chapter is preamble-stripped then rendered by
+:func:`html_to_text`); :func:`detect_format` is the shared magic-number
+classifier (third country-local sniffer promoted, DNK/ISL precedent).
 
 Out of scope for all of these: tokenizing, chunking, dedup, language
 ID, cross-country normalization, semantic extraction, OCR (2026-09-19
@@ -26,8 +30,10 @@ I/O and no engine dependency (no pack→engine coupling).
 from __future__ import annotations
 
 import io
+import posixpath
 import re
 import xml.etree.ElementTree as ET
+import zipfile
 from collections import Counter, defaultdict
 from collections.abc import Iterator, Sequence
 
@@ -44,6 +50,8 @@ from pdfminer.layout import (
 )
 
 __all__ = [
+    "detect_format",
+    "epub_to_text",
     "geometry_pdf_to_text",
     "html_to_text",
     "measure_pdf",
@@ -218,6 +226,190 @@ def xml_to_text(
     walk(root)
     flush()
     return _finish_lines(lines)
+
+
+# -- EPUB: navigation shell over the html engine (2026-10-02) ----------------------
+# AUS is the first consumer (76,634 EPUB documents); probe findings baked in:
+# FRL containers violate the OCF mimetype first-entry rule (mimetype sits
+# last) and their container.xml namespace drops the ":1.0" suffix — so the
+# engine never consults mimetype and matches elements by local name.
+
+_EPUB_CONTAINER = "META-INF/container.xml"
+
+_PREAMBLE = re.compile(
+    rb"^(?:\xef\xbb\xbf)?\s*(?:<\?xml[^?]*\?>)?\s*"
+    rb"(?:<!DOCTYPE[^>\[]*(?:\[[^\]]*\])?[^>\[]*>)?\s*"
+)
+
+_ENCODING_DECL = re.compile(rb"""<\?xml[^?]*?encoding=["']([-A-Za-z0-9_.]+)["']""")
+
+
+def detect_format(data: bytes) -> str:
+    """Shared magic-number classifier (framework-epub-cleaning 2.2; third
+    country-local sniffer promoted — DNK/ISL each hand-rolled one, AUS is
+    the third consumer). Returns ``'pdf'``, ``'epub'``, ``'html'``,
+    ``'xml'`` or ``'unknown'``.
+
+    Order: ``%PDF-`` prefix → pdf; ``PK`` magic with a
+    ``META-INF/container.xml`` member → epub (mimetype deliberately not
+    consulted — the real corpus violates the first-entry rule); a
+    ``<!doctype html`` marker or ``<html`` inside the leading window →
+    html (html checks before xml, so XHTML with a declaration routes to
+    the html engine — html.parser is safe on lowercase XHTML while
+    ElementTree dies on undeclared entities like ``&nbsp;``); a leading
+    ``<?xml`` declaration → xml; anything else → ``'unknown'``. No
+    guessing: unknown is a value, and the caller owns the loud conversion
+    (country packs turn it into a PermanentError). Survey scans count
+    unknowns instead of dying on file #12.
+    """
+    if data[:5] == b"%PDF-":
+        return "pdf"
+    if data[:4] == b"PK\x03\x04":
+        try:
+            with zipfile.ZipFile(io.BytesIO(data)) as zf:
+                if _EPUB_CONTAINER in zf.namelist():
+                    return "epub"
+        except zipfile.BadZipFile:
+            pass
+        return "unknown"
+    head = data[:1024]
+    if head.startswith(b"\xef\xbb\xbf"):
+        head = head[3:]
+    window = head.decode("latin-1").lower()
+    if "<!doctype html" in window or "<html" in window:
+        return "html"
+    if window.lstrip().startswith("<?xml"):
+        return "xml"
+    return "unknown"
+
+
+def epub_to_text(
+    epub: bytes,
+    *,
+    keep: str | None = None,
+    drop: Sequence[str] = (),
+    drop_strings: Sequence[str] = (),
+) -> str:
+    """Render EPUB bytes to deterministic plain text: a pure navigation
+    shell over :func:`html_to_text` (framework-epub-cleaning 2.1) — no new
+    rendering logic.
+
+    Navigation: the ZIP is unpacked in memory, ``META-INF/container.xml``
+    locates the OPF package (elements matched by local name — real
+    producers write non-standard namespaces), and the spine lists the
+    chapter files in reading order (the authoritative order per OCF; the
+    NCX is never read, ``linear`` attributes ignored — cleaning wants all
+    body content). Each chapter's XML declaration and DOCTYPE are stripped
+    at byte level (both leak into the rendered text otherwise — AUS probe
+    finding), then the chapter goes to :func:`html_to_text` with
+    ``keep``/``drop``/``drop_strings`` passed through; chapters join with
+    one blank line (the same convention as multiple kept containers).
+
+    ``mimetype`` is never consulted (plan ruling ①: the OCF first-entry
+    rule is ceremonial — the real FRL corpus violates it 100%; structure
+    is the truth).
+
+    Loud failures (ValueError; the country pack converts to
+    PermanentError): not a ZIP, missing/malformed container.xml, no
+    rootfile, missing OPF, empty spine, a spine idref without a manifest
+    item, a missing chapter member, and a chapter that declares an
+    encoding it does not actually have (declared-but-false bytes would
+    mangle silently downstream; undeclared chapters go to bs4 charset
+    sniffing — the same contract every raw HTML file gets). ``keep``
+    matching nothing raises through the html engine's whitelist contract.
+
+    Output contract identical to :func:`html_to_text`; same bytes in,
+    same bytes out.
+    """
+    try:
+        zf = zipfile.ZipFile(io.BytesIO(epub))
+    except zipfile.BadZipFile as exc:
+        raise ValueError(f"EPUB: not a ZIP container: {exc}") from exc
+    with zf:
+        chapter_names = _epub_spine_members(zf)
+        lines: list[str] = []
+        for name in chapter_names:
+            chapter = _zip_member(zf, name)
+            _check_chapter_encoding(chapter, name)
+            text = html_to_text(
+                _strip_preamble(chapter),
+                keep=keep,
+                drop=drop,
+                drop_strings=drop_strings,
+            )
+            if text:
+                lines.extend(text.split("\n")[:-1])  # drop the trailing-newline artifact
+            lines.append("")  # blank line between chapters
+    return _finish_lines(lines)
+
+
+def _strip_preamble(chapter: bytes) -> bytes:
+    """Remove a leading BOM, XML declaration and DOCTYPE (byte level —
+    the chapter is handed on as bytes; the html engine owns decoding).
+    DOCTYPE internal subsets ``[ ... ]`` are covered."""
+    return _PREAMBLE.sub(b"", chapter, count=1)
+
+
+def _check_chapter_encoding(chapter: bytes, name: str) -> None:
+    """A chapter declaring ``encoding="E"`` must actually decode as E —
+    declared-but-false bytes are the loud undecodable case (plan §3)."""
+    match = _ENCODING_DECL.search(chapter[:256])
+    if match is None:
+        return
+    encoding = match.group(1).decode("ascii")
+    try:
+        chapter.decode(encoding)
+    except (UnicodeDecodeError, LookupError) as exc:
+        raise ValueError(
+            f"EPUB: chapter {name!r} declares encoding {encoding!r} "
+            f"but is not decodable as such: {exc}"
+        ) from exc
+
+
+def _epub_spine_members(zf: zipfile.ZipFile) -> list[str]:
+    """Chapter member names in spine order: container.xml → OPF → spine,
+    elements matched by local name (real namespaces vary)."""
+    container = _zip_member(zf, _EPUB_CONTAINER)
+    try:
+        container_root = ET.fromstring(container)
+    except ET.ParseError as exc:
+        raise ValueError(f"EPUB: {_EPUB_CONTAINER} is malformed: {exc}") from exc
+    rootfile = next(
+        (el for el in container_root.iter() if _local_tag(el.tag) == "rootfile"),
+        None,
+    )
+    opf_name = rootfile.get("full-path") if rootfile is not None else None
+    if not opf_name:
+        raise ValueError(f"EPUB: {_EPUB_CONTAINER} declares no rootfile full-path")
+    opf_root = ET.fromstring(_zip_member(zf, opf_name))  # malformed OPF dies loudly
+    manifest: dict[str, str] = {}
+    for el in opf_root.iter():
+        if _local_tag(el.tag) == "item":
+            item_id = el.get("id")
+            href = el.get("href")
+            if item_id and href:
+                manifest[item_id] = href
+    names: list[str] = []
+    for el in opf_root.iter():
+        if _local_tag(el.tag) != "itemref":
+            continue
+        idref = el.get("idref")
+        href = manifest.get(idref, "") if idref else ""
+        if not href:
+            raise ValueError(f"EPUB: spine itemref {idref!r} has no manifest item")
+        names.append(
+            posixpath.normpath(posixpath.join(posixpath.dirname(opf_name), href))
+        )
+    if not names:
+        raise ValueError(f"EPUB: {opf_name} has an empty spine")
+    return names
+
+
+def _zip_member(zf: zipfile.ZipFile, name: str) -> bytes:
+    try:
+        return zf.read(name)
+    except KeyError:
+        raise ValueError(f"EPUB: member {name!r} is missing") from None
 
 
 def _render(node: Tag) -> list[str]:
