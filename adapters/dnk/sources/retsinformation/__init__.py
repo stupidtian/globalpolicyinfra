@@ -288,6 +288,11 @@ def start_tasks(params: dict[str, Any]) -> list[TaskSeed]:
 
 
 def build_source() -> SourceDefinition:
+    from adapters.base import CleanDefinition
+    from adapters.dnk.sources.retsinformation.clean import (
+        CLEAN_VERSION,
+        RetsinformationCleanHandler,
+    )
     from adapters.dnk.sources.retsinformation.doc import RtDocHandler
     from adapters.dnk.sources.retsinformation.harvest import RtHarvestHandler
     from adapters.dnk.sources.retsinformation.sitemap import RtSitemapHandler
@@ -305,7 +310,17 @@ def build_source() -> SourceDefinition:
             "rt_text": RtTextHandler(),
             "rt_harvest": RtHarvestHandler(),
             "rt_sitemap": RtSitemapHandler(),
+            "retsinformation_clean": RetsinformationCleanHandler(),
         },
+        # Dual-carrier corpus (one full-text carrier per document, probed
+        # 2026-09-29): the clean handler sniffs bytes and routes to the
+        # probed XML block vocabulary or the #INDHOLD HTML container. A
+        # version bump reseeds every cleaned document.
+        clean=CleanDefinition(
+            task_type="retsinformation_clean",
+            version=CLEAN_VERSION,
+            targets=("rt_doc",),
+        ),
         domain_schema="""
         CREATE TABLE IF NOT EXISTS laws (
             law_key TEXT PRIMARY KEY,
