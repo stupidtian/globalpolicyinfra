@@ -172,6 +172,11 @@ def start_tasks(params: dict[str, Any]) -> list[TaskSeed]:
 
 
 def build_source() -> SourceDefinition:
+    from adapters.base import CleanDefinition
+    from adapters.lva.sources.vestnesis.clean import (
+        CLEAN_VERSION,
+        VestnesisCleanHandler,
+    )
     from adapters.lva.sources.vestnesis.doc import VestnesisDocHandler
     from adapters.lva.sources.vestnesis.list import VestnesisListHandler
 
@@ -181,5 +186,13 @@ def build_source() -> SourceDefinition:
         task_types={
             "vestnesis_list": VestnesisListHandler(),
             "vestnesis_doc": VestnesisDocHandler(),
+            "vestnesis_clean": VestnesisCleanHandler(),
         },
+        # Body container rule probed across both page generations and three
+        # eras (docs/tasks/2026-09-14-lva/clean-probe/); version bumps re-clean.
+        clean=CleanDefinition(
+            task_type="vestnesis_clean",
+            version=CLEAN_VERSION,
+            targets=("vestnesis_doc",),
+        ),
     )
