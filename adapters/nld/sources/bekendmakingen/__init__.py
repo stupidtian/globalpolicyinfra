@@ -63,6 +63,11 @@ bek_year         one (year, blad) sweep of the whole content-area year,
                  lives in content-area stb/2007; found in the 2000-2025
                  backfill, 2026-09-30). Converges with bek_day at the
                  identity layer — same identifier, done tasks skip
+bekendmakingen_clean   one document -> deterministic plain text
+                 (framework-cleaning): local read of doc.xml, rendered
+                 with the shared SDU/op-xsd block vocabulary
+                 (clean.py; declared via SourceDefinition.clean,
+                 version 1, targets bek_item)
 ===============  =====================================================
 
 Params (key=value on the CLI)::
@@ -280,6 +285,11 @@ def start_tasks(params: dict[str, Any]) -> list[TaskSeed]:
 
 
 def build_bekendmakingen() -> SourceDefinition:
+    from adapters.base import CleanDefinition
+    from adapters.nld.sources.bekendmakingen.clean import (
+        CLEAN_VERSION,
+        BekendmakingenCleanHandler,
+    )
     from adapters.nld.sources.bekendmakingen.day import (
         BekDayHandler,
         BekYearHandler,
@@ -293,6 +303,12 @@ def build_bekendmakingen() -> SourceDefinition:
             "bek_day": BekDayHandler(),
             "bek_year": BekYearHandler(),
             "bek_item": BekItemHandler(),
+            "bekendmakingen_clean": BekendmakingenCleanHandler(),
         },
+        clean=CleanDefinition(
+            task_type="bekendmakingen_clean",
+            version=CLEAN_VERSION,
+            targets=("bek_item",),
+        ),
         parallel_safe=True,
     )
