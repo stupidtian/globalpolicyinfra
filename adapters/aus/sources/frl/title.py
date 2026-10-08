@@ -113,6 +113,7 @@ class FrlTitleHandler:
             )
 
         mode_comp = str(task.params.get("comp", "anchor"))
+        layer = str(task.params.get("layer", "full"))
         gazette = str(task.params.get("gazette", "0")) == "1"
         collection = title.get("collection") or ""
 
@@ -122,6 +123,10 @@ class FrlTitleHandler:
             if comp == _AS_MADE:
                 role, as_made = "asmade", True
             elif comp is not None:
+                if layer == "asmade":
+                    # time-series capture: publication-time texts only,
+                    # compilations are out of scope for this sweep
+                    continue
                 if mode_comp != "all" and version["start"] != documented_start:
                     continue
                 role, as_made = "comp", False
@@ -145,9 +150,14 @@ class FrlTitleHandler:
                             else version["start"]
                         ),
                         # ES (explanatory statement) belongs to instruments'
-                        # as-made versions only; compilations of Acts have
-                        # no statement and as-made Acts never do either.
-                        "es": "1" if as_made and collection not in ("Act", "") else "0",
+                        # as-made versions only, and only the full layer
+                        # wants it; compilations of Acts have no statement
+                        # and as-made Acts never do either.
+                        "es": (
+                            "1"
+                            if as_made and layer == "full" and collection not in ("Act", "")
+                            else "0"
+                        ),
                         "gazette": "1" if gazette else "0",
                     },
                 )

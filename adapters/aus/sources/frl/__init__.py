@@ -34,6 +34,11 @@ frl_day          seed: one registration day — Versions whose
                  day with zero events (weekend) is a legal empty and
                  still advances the date cursor; a full page of 100
                  chains to the next $skip
+frl_made         seed: one page of the making-date enumeration
+                 (made=FROM:TO) — Titles made in the range, $top=100
+                 per page, chained by $skip; spawns frl_title per id;
+                 never touches the registration cursor (independent
+                 axis — see docs/countries/aus/frl-zh.md §7)
 frl_title        one title with its full version lineage
                  (Titles('{id}')?$expand=versions); upserts the titles
                  row, rewrites title_versions, archives the raw
@@ -44,7 +49,8 @@ frl_docs         one version's file inventory (Documents filtered by
                  picks formats (EPUB volume 0 first, PDF fallback) and
                  spawns one frl_doc per file
 frl_doc          one file via documents/find(asat=version start);
-                 decodes the base64 envelope, verifies the ZIP/PDF
+                 decodes the payload (JSON envelope or raw stream —
+                 the server chooses per title), verifies the ZIP/PDF
                  magic, writes the file and one documents row hanging
                  off the title entity
 ===============  =====================================================
@@ -52,13 +58,25 @@ frl_doc          one file via documents/find(asat=version start);
 Params (key=value on the CLI)::
 
     window=2026-08-27:2026-08-28   closed registration-date range
-                                    (required, or sync=1)
+                                    (or sync=1, or made=FROM:TO)
     sync=1                          from = day after the kv cursor
                                     frl_last_date, to = today
-    max_titles=5                    cap on frl_title spawns per day
-                                    (test guard)
-    comp=anchor|all                 compilation layer: latest anchor
-                                    (default) or every compilation
+    made=2010-01-01:2010-12-31      backfill entry: every title *made*
+                                    in the closed range (making-date
+                                    axis — registration dates of old
+                                    titles are 2005–2013 back-import
+                                    stamps and cannot answer
+                                    making-year questions)
+    max_titles=5                    cap on frl_title spawns per
+                                    enumeration task (test guard)
+    layer=full|asmade               capture layer: full = as-made +
+                                    latest compiled anchor (default);
+                                    asmade = publication-time texts
+                                    only, no compilations, no ES
+                                    (time-series corpus)
+    comp=anchor|all                 compilation layer under layer=full:
+                                    latest anchor (default) or every
+                                    compilation
     gazette=0|1                     download Gazette texts too (default
                                     0: Gazette titles stay ledger-only)
 """
@@ -69,13 +87,15 @@ from datetime import UTC, date, datetime, timedelta
 from typing import Any
 from urllib.parse import quote
 
-from adapters.base import SourceDefinition, TaskSeed
+from adapters.base import CleanDefinition, SourceDefinition, TaskSeed
 
 __all__ = [
     "API_BASE",
     "COMP_ALL",
     "COMP_ANCHOR",
     "CURSOR_KEY",
+    "LAYER_ASMADE",
+    "LAYER_FULL",
     "PAGE_SIZE",
     "SITE_BASE",
     "build_source",
@@ -92,6 +112,8 @@ PAGE_SIZE = 100  # server-enforced $top cap (probed: >100 → HTTP 400)
 
 COMP_ANCHOR = "anchor"
 COMP_ALL = "all"
+LAYER_FULL = "full"
+LAYER_ASMADE = "asmade"
 
 #: FRL collection → cross-country doc_type (soft mapping; the FRL word is
 #: always kept in meta.collection). Probed vocabulary, 2026-08-31.
@@ -112,7 +134,8 @@ def collection_doc_type(collection: str | None) -> str:
 
 
 def odata_url(path: str, filter_expr: str | None = None, expand: str | None = None,
-              skip: int = 0, top: int | None = PAGE_SIZE) -> str:
+              skip: int = 0, top: int | None = PAGE_SIZE,
+              select: str | None = None) -> str:
     """Build an API URL with a properly encoded OData query.
 
     Spaces are %20-encoded; apostrophes and time colons stay literal —
@@ -126,6 +149,8 @@ def odata_url(path: str, filter_expr: str | None = None, expand: str | None = No
         parts.append("$filter=" + quote(filter_expr, safe="':"))
     if expand:
         parts.append("$expand=" + expand)
+    if select:
+        parts.append("$select=" + select)
     if top is not None:
         parts.append(f"$top={top}")
     if skip:
@@ -155,6 +180,7 @@ def _fail(message: str) -> SystemExit:
         "usage examples:\n"
         "  python cli.py collect --country aus --source frl window=2026-08-27:2026-08-28\n"
         "  python cli.py collect --country aus --source frl sync=1\n"
+        "  python cli.py collect --country aus --source frl made=2010-01-01:2010-12-31 layer=asmade\n"
         "  python cli.py status --country aus --source frl"
     )
 
@@ -167,19 +193,47 @@ def _parse_date(raw: str, label: str) -> str:
     return raw
 
 
-def _mode(params: dict[str, Any]) -> dict[str, Any]:
-    """Shared sweep options flowing down the task chain (day → title →
+def _mode(params: dict[str, Any]) -> dict[str, str]:
+    """Shared sweep options flowing down the task chain (seed → title →
     docs): they are part of the sweep's identity, so they belong in task
     params (task_id) rather than ambient state."""
     comp = str(params.get("comp", COMP_ANCHOR)).strip()
     if comp not in (COMP_ANCHOR, COMP_ALL):
         raise _fail(f"comp must be anchor or all (got {comp!r})")
     gazette = str(params.get("gazette", "0")).strip() in ("1", "true", "yes")
-    return {"comp": comp, "gazette": "1" if gazette else "0"}
+    layer = str(params.get("layer", LAYER_FULL)).strip()
+    if layer not in (LAYER_FULL, LAYER_ASMADE):
+        raise _fail(f"layer must be full or asmade (got {layer!r})")
+    return {"comp": comp, "gazette": "1" if gazette else "0", "layer": layer}
+
+
+def _max_titles(params: dict[str, Any]) -> str:
+    raw = str(params.get("max_titles", "")).strip()
+    if raw and not raw.isdigit():
+        raise _fail(f"max_titles must be a positive integer (got {raw!r})")
+    return raw
 
 
 def start_tasks(params: dict[str, Any]) -> list[TaskSeed]:
     is_sync = str(params.get("sync", "")).strip() in ("1", "true", "yes")
+    mode = _mode(params)
+    max_titles = _max_titles(params)
+
+    if params.get("made"):
+        if params.get("window"):
+            raise _fail("give only one of made= and window=")
+        made_range = str(params["made"])
+        from_str, sep, to_str = made_range.partition(":")
+        if not sep or not from_str or not to_str:
+            raise _fail(f"made must look like FROM:TO (got {made_range!r})")
+        from_str = _parse_date(from_str.strip(), "made FROM")
+        to_str = _parse_date(to_str.strip(), "made TO")
+        if from_str > to_str:
+            raise _fail(f"made start {from_str} is after its end {to_str}")
+        made_params: dict[str, Any] = {**mode, "from": from_str, "to": to_str}
+        if max_titles:
+            made_params["max_titles"] = max_titles
+        return [TaskSeed(type="frl_made", params=made_params)]
 
     if params.get("window"):
         window = str(params["window"])
@@ -196,21 +250,17 @@ def start_tasks(params: dict[str, Any]) -> list[TaskSeed]:
         from_str = (date.fromisoformat(cursor) + timedelta(days=1)).isoformat()
         to_str = datetime.now(UTC).date().isoformat()
     else:
-        raise _fail("give window=FROM:TO or sync=1")
+        raise _fail("give window=FROM:TO, made=FROM:TO, or sync=1")
 
     if from_str > to_str:
         raise _fail(f"window start {from_str} is after its end {to_str}")
 
-    mode = _mode(params)
-    max_titles = str(params.get("max_titles", "")).strip()
     seeds: list[TaskSeed] = []
     day = date.fromisoformat(from_str)
     end = date.fromisoformat(to_str)
     while day <= end:
-        day_params = {**mode, "date": day.isoformat()}
+        day_params: dict[str, Any] = {**mode, "date": day.isoformat()}
         if max_titles:
-            if not max_titles.isdigit():
-                raise _fail(f"max_titles must be a positive integer (got {max_titles!r})")
             day_params["max_titles"] = max_titles
         seeds.append(TaskSeed(type="frl_day", params=day_params))
         day += timedelta(days=1)
@@ -254,9 +304,11 @@ CREATE TABLE IF NOT EXISTS title_versions (
 """
 
 def build_source() -> SourceDefinition:
+    from adapters.aus.sources.frl.clean import CLEAN_VERSION, FrlCleanHandler
     from adapters.aus.sources.frl.day import FrlDayHandler
     from adapters.aus.sources.frl.doc import FrlDocHandler
     from adapters.aus.sources.frl.docs import FrlDocsHandler
+    from adapters.aus.sources.frl.made import FrlMadeHandler
     from adapters.aus.sources.frl.title import FrlTitleHandler
 
     return SourceDefinition(
@@ -264,11 +316,24 @@ def build_source() -> SourceDefinition:
         start_tasks=start_tasks,
         task_types={
             "frl_day": FrlDayHandler(),
+            "frl_made": FrlMadeHandler(),
             "frl_title": FrlTitleHandler(),
             "frl_docs": FrlDocsHandler(),
             "frl_doc": FrlDocHandler(),
+            "frl_clean": FrlCleanHandler(),
         },
         domain_schema=DOMAIN_SCHEMA,
         domain_tables=("titles", "title_versions"),
         domain_keys={"titles": ("title_id",), "title_versions": ("title_id", "start")},
+        # no cookies, no tokens, no cross-task transport state (probed
+        # 2026-08-31): every task is an independent keyless GET
+        parallel_safe=True,
+        # Cleaning rules table is deliberately EMPTY (probed 2026-08-31 and
+        # 2026-10-02: FRL as-made EPUBs carry zero site decoration; the pdf
+        # leg needs no routing rules — every PDF is digital-native geometry)
+        clean=CleanDefinition(
+            task_type="frl_clean",
+            version=CLEAN_VERSION,
+            targets=("frl_doc",),
+        ),
     )
