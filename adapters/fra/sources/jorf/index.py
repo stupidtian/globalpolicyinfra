@@ -39,7 +39,8 @@ def _to_iso(ymd: str) -> str:
 
 class JorfIndexHandler:
     def build_request(self, task: TaskView) -> RequestSpec:
-        return RequestSpec(url=f"{BASE_URL}/", headers={"User-Agent": USER_AGENT})
+        base = str(task.params.get("base", BASE_URL)).rstrip("/")
+        return RequestSpec(url=f"{base}/", headers={"User-Agent": USER_AGENT})
 
     def parse(self, response: Response, task: TaskView) -> TaskResult:
         listing = response.content.decode("iso-8859-1")
@@ -66,9 +67,13 @@ class JorfIndexHandler:
                     "— history lives in the global stock archive)"
                 )
             )
+        base = str(task.params.get("base", BASE_URL)).rstrip("/")
         return TaskResult(
             next_tasks=[
-                TaskSeed(type="jorf_issue", params={"date": _to_iso(ymd), "filename": name})
+                TaskSeed(
+                    type="jorf_issue",
+                    params={"date": _to_iso(ymd), "filename": name, "base": base},
+                )
                 for ymd, name in selected
             ]
         )

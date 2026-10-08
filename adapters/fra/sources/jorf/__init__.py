@@ -104,7 +104,13 @@ def start_tasks(params: dict[str, Any]) -> list[TaskSeed]:
     if from_str > to_str:
         raise _fail(f"window start {from_str} is after its end {to_str}")
 
-    return [TaskSeed(type="jorf_index", params={"from": from_str, "to": to_str})]
+    # base= points the source at a static mirror of the directory (used by
+    # the stock backfill: tools/fra_stock_split.py shards the 1990+ whole-
+    # corpus archive into per-day tarballs served over localhost). Defaults
+    # to the real DILA directory.
+    base = str(params.get("base", "")).strip().rstrip("/") or BASE_URL
+
+    return [TaskSeed(type="jorf_index", params={"from": from_str, "to": to_str, "base": base})]
 
 
 def build_source() -> SourceDefinition:

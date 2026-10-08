@@ -68,8 +68,9 @@ def _issue_folder(num_parution: str, publication_date: str, task_date: str) -> s
 
 class JorfIssueHandler:
     def build_request(self, task: TaskView) -> RequestSpec:
+        base = str(task.params.get("base", BASE_URL)).rstrip("/")
         return RequestSpec(
-            url=f"{BASE_URL}/{task.params['filename']}",
+            url=f"{base}/{task.params['filename']}",
             headers={"User-Agent": USER_AGENT},
         )
 
