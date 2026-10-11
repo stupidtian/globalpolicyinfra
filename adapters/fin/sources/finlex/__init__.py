@@ -275,6 +275,8 @@ CREATE TABLE IF NOT EXISTS statutes (
 
 
 def build_source() -> SourceDefinition:
+    from adapters.base import CleanDefinition
+    from adapters.fin.sources.finlex.clean import CLEAN_VERSION, FinlexCleanHandler
     from adapters.fin.sources.finlex.enum import (
         SdDayHandler,
         SdFixHandler,
@@ -290,7 +292,18 @@ def build_source() -> SourceDefinition:
             "sd_year_page": SdYearPageHandler(),
             "sd_fix": SdFixHandler(),
             "sd_fetch": SdFetchHandler(),
+            "finlex_clean": FinlexCleanHandler(),
         },
+        # AkomaNtoso block map probed across 11 decades of gazette shapes
+        # (docs/tasks/2026-09-13-fin/clean-probe/); version bumps re-clean.
+        # Single-language scope (Finnish) enforced in the handler itself —
+        # legacy bilingual-chain documents ride the queue as explained
+        # empties.
+        clean=CleanDefinition(
+            task_type="finlex_clean",
+            version=CLEAN_VERSION,
+            targets=("sd_fetch",),
+        ),
         domain_schema=DOMAIN_SCHEMA,
         domain_tables=("statutes",),
         domain_keys={"statutes": ("year", "number")},
