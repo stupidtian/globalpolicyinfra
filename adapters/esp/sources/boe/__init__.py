@@ -51,7 +51,7 @@ from __future__ import annotations
 from datetime import UTC, date, datetime, timedelta
 from typing import Any
 
-from adapters.base import SourceDefinition, TaskSeed
+from adapters.base import CleanDefinition, SourceDefinition, TaskSeed
 
 __all__ = [
     "ACCEPT_XML",
@@ -147,6 +147,7 @@ def start_tasks(params: dict[str, Any]) -> list[TaskSeed]:
 
 
 def build_source() -> SourceDefinition:
+    from adapters.esp.sources.boe.clean import CLEAN_VERSION, BoeCleanHandler
     from adapters.esp.sources.boe.item import BoeItemHandler
     from adapters.esp.sources.boe.sumario import BoeSumarioHandler
 
@@ -156,5 +157,16 @@ def build_source() -> SourceDefinition:
         task_types={
             "boe_sumario": BoeSumarioHandler(),
             "boe_item": BoeItemHandler(),
+            "boe_clean": BoeCleanHandler(),
         },
+        # Single-carrier gazette corpus (31,057 item XMLs, full census
+        # 2026-10-08): xml_to_text over the probed block vocabulary; the
+        # metadata blocks go whole (their nested <texto> reference
+        # descriptions would collide with the body's root texto), the
+        # official title is prepended as the first line (user-ruled).
+        clean=CleanDefinition(
+            task_type="boe_clean",
+            version=CLEAN_VERSION,
+            targets=("boe_item",),
+        ),
     )
