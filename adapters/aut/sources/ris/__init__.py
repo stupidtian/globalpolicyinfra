@@ -36,7 +36,7 @@ from __future__ import annotations
 from datetime import UTC, date, datetime, timedelta
 from typing import Any
 
-from adapters.base import SourceDefinition, TaskSeed
+from adapters.base import CleanDefinition, SourceDefinition, TaskSeed
 
 __all__ = [
     "API_BASE",
@@ -202,6 +202,7 @@ def start_tasks(params: dict[str, Any]) -> list[TaskSeed]:
 
 
 def build_source() -> SourceDefinition:
+    from adapters.aut.sources.ris.clean import CLEAN_VERSION, BgblCleanHandler
     from adapters.aut.sources.ris.file import BgblFileHandler
     from adapters.aut.sources.ris.window import BgblWindowHandler
 
@@ -211,5 +212,16 @@ def build_source() -> SourceDefinition:
         task_types={
             "bgbl_window": BgblWindowHandler(),
             "bgbl_file": BgblFileHandler(),
+            "bgbl_clean": BgblCleanHandler(),
         },
+        # Single-carrier gazette corpus (22,525 risdok + 1 erechtdok root,
+        # probed 2026-10-03): the clean handler renders the RIS XML with the
+        # probed block vocabulary plus a glyph-element pre-pass. Documents
+        # are registered by the window task (produced_by), the file task
+        # only attaches bytes — hence targets=("bgbl_window",).
+        clean=CleanDefinition(
+            task_type="bgbl_clean",
+            version=CLEAN_VERSION,
+            targets=("bgbl_window",),
+        ),
     )
