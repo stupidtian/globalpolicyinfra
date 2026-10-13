@@ -28,6 +28,12 @@ lt_pack          one bulk package: GET ``/v1/publicData/get/{filename}``
                  transaction (user ruling 2026-09-03: the 38,182-entry
                  archive package is accepted as a single large write in
                  exchange for a one-time 69 MB download per sweep).
+lovtidende_clean one stored document -> plain text via the local-read
+                 clean channel: content-sniffed (files are named doc.xml
+                 but are 100% HTML, corpus census 2026-10-05) and stripped
+                 by the pure whitelist ``main.documentBody`` rule — the
+                 metadata header, table of contents and any page furniture
+                 sit outside the container and vanish; see clean.py.
 ===============  =====================================================
 
 Params (key=value on the CLI)::
@@ -89,7 +95,12 @@ def start_tasks(params: dict[str, Any]) -> list[TaskSeed]:
 
 
 def build_source() -> SourceDefinition:
+    from adapters.base import CleanDefinition
     from adapters.nor.sources.lovtidende.catalog import LtListHandler
+    from adapters.nor.sources.lovtidende.clean import (
+        CLEAN_VERSION,
+        LovtidendeCleanHandler,
+    )
     from adapters.nor.sources.lovtidende.pack import LtPackHandler
 
     return SourceDefinition(
@@ -98,5 +109,15 @@ def build_source() -> SourceDefinition:
         task_types={
             "lt_list": LtListHandler(),
             "lt_pack": LtPackHandler(),
+            "lovtidende_clean": LovtidendeCleanHandler(),
         },
+        # Body rule: pure whitelist on main.documentBody, routed by content
+        # (files are named doc.xml but are 100% HTML, corpus census
+        # 2026-10-05 in docs/tasks/2026-09-03-nor/clean-probe/); version
+        # bumps reseed the whole corpus.
+        clean=CleanDefinition(
+            task_type="lovtidende_clean",
+            version=CLEAN_VERSION,
+            targets=("lt_pack",),
+        ),
     )
