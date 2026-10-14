@@ -79,7 +79,7 @@ import re
 from datetime import UTC, date, datetime, timedelta
 from typing import Any
 
-from adapters.base import SourceDefinition, TaskSeed
+from adapters.base import CleanDefinition, SourceDefinition, TaskSeed
 
 __all__ = [
     "ALIAS_VER",
@@ -299,6 +299,7 @@ def start_tasks(params: dict[str, Any]) -> list[TaskSeed]:
 
 
 def build_slovlex() -> SourceDefinition:
+    from adapters.svk.sources.slovlex.clean import CLEAN_VERSION, SlovlexCleanHandler
     from adapters.svk.sources.slovlex.doc import SvkDocHandler
     from adapters.svk.sources.slovlex.list import SvkListHandler
     from adapters.svk.sources.slovlex.pdf import SvkPdfHandler
@@ -310,5 +311,15 @@ def build_slovlex() -> SourceDefinition:
             "svk_list": SvkListHandler(),
             "svk_pdf": SvkPdfHandler(),
             "svk_doc": SvkDocHandler(),
+            "slovlex_clean": SlovlexCleanHandler(),
         },
+        # Body-container rules probed across 2000–2025 × both document
+        # families (docs/tasks/2026-09-03-svk/clean-probe/, 28/28);
+        # version bumps re-clean. All 41,634 documents are HTML main
+        # files — the 57 PDFs are siblings (meta.files), so no pdf_rules.
+        clean=CleanDefinition(
+            task_type="slovlex_clean",
+            version=CLEAN_VERSION,
+            targets=("svk_doc",),
+        ),
     )
