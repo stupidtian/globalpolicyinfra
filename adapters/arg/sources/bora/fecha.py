@@ -53,5 +53,10 @@ class BoraFechaHandler:
             raise ValueError(f"fecha {date}: selector body is not JSON: {exc}") from exc
         if not isinstance(body, dict):
             raise TypeError(f"fecha {date}: selector body is {type(body).__name__}")
-        params: dict[str, str] = {"date": date, "to": to, "run": str(task.params["run"])}
+        params: dict[str, str] = {
+            "date": date,
+            "to": to,
+            "run": str(task.params["run"]),
+            "rubros": str(task.params.get("rubros", "all")),
+        }
         return TaskResult(next_tasks=[TaskSeed(type="bora_seccion", params=params)])

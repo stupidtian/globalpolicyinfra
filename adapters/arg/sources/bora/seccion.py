@@ -45,7 +45,7 @@ from __future__ import annotations
 import re
 from urllib.parse import quote
 
-from adapters.arg.sources.bora import BASE_URL, CURSOR_KEY, SECCION
+from adapters.arg.sources.bora import BASE_URL, SECCION, normalize_rubro
 from adapters.base import RequestSpec, Response, TaskResult, TaskSeed, TaskView
 
 __all__ = ["BoraSeccionHandler", "parse_listing"]
@@ -160,6 +160,7 @@ def _next_day_params(task: TaskView) -> TaskSeed | None:
             "date": (day + timedelta(days=1)).isoformat(),
             "to": str(task.params["to"]),
             "run": str(task.params["run"]),
+            "rubros": str(task.params.get("rubros", "all")),
         },
     )
 
@@ -184,10 +185,13 @@ class BoraSeccionHandler:
         )
 
     def parse(self, response: Response, task: TaskView) -> TaskResult:
+        from adapters.arg.sources.bora import cursor_key
         from runtime.errors import TransientError
 
         date_iso = str(task.params["date"])
         pag = int(task.params.get("pag", 1))
+        rubros_param = str(task.params.get("rubros", "all"))
+        key = cursor_key(rubros_param)
         next_day = _next_day_params(task)
 
         if pag == 1:
@@ -201,7 +205,7 @@ class BoraSeccionHandler:
                             f"BORA has no edition on {date_iso} (the section "
                             "page redirects to the homepage)"
                         ),
-                        cursor_updates={CURSOR_KEY: date_iso},
+                        cursor_updates={key: date_iso},
                         next_tasks=[next_day] if next_day else [],
                     )
                 raise ValueError(
@@ -225,7 +229,19 @@ class BoraSeccionHandler:
             more = bool(payload.get("hay_mas_datos"))
             ult_rubro = str(payload.get("ult_rubro") or "")
 
-        items = parse_listing(html, date_iso)
+        raw_items = parse_listing(html, date_iso)
+        items = raw_items
+        if rubros_param != "all":
+            # Enumeration-layer scope filter (user ruling 2026-10-08): the
+            # rubro header is known right here in the listing, so excluded
+            # kinds never cost a detail request. Rows without a rubro header
+            # are kept (fail-open: not classifiable natively here).
+            scope = set(rubros_param.split(","))
+            items = [
+                item
+                for item in raw_items
+                if not item["rubro"] or normalize_rubro(item["rubro"]) in scope
+            ]
         seeds = [
             TaskSeed(type="bora_detalle", params=_detalle_params(item)) for item in items
         ]
@@ -234,6 +250,7 @@ class BoraSeccionHandler:
                 "date": date_iso,
                 "to": str(task.params["to"]),
                 "run": str(task.params["run"]),
+                "rubros": rubros_param,
                 "pag": str(pag + 1),
             }
             if ult_rubro:
@@ -245,11 +262,18 @@ class BoraSeccionHandler:
         if next_day:
             seeds.append(next_day)
         if not seeds:
-            return TaskResult(
-                expected_empty=(
+            if raw_items:
+                reason = (
+                    f"all {len(raw_items)} rows on the final page of {date_iso} "
+                    f"fall outside the rubros scope ({rubros_param})"
+                )
+            else:
+                reason = (
                     f"page {pag} of {date_iso} carries no rows — the day is "
                     "complete (earlier pages hold the avisos)"
-                ),
-                cursor_updates={CURSOR_KEY: date_iso},
+                )
+            return TaskResult(
+                expected_empty=reason,
+                cursor_updates={key: date_iso},
             )
-        return TaskResult(next_tasks=seeds, cursor_updates={CURSOR_KEY: date_iso})
+        return TaskResult(next_tasks=seeds, cursor_updates={key: date_iso})

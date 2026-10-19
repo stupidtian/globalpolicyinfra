@@ -65,6 +65,8 @@ an old window is repair-channel territory, not a re-sweep).
 
 from __future__ import annotations
 
+import hashlib
+import re
 from datetime import UTC, date, datetime, timedelta
 from typing import Any
 
@@ -91,6 +93,67 @@ XHR_HEADERS = {
 
 CURSOR_KEY = "bora_last_date"
 
+#: ``rubros`` scope presets (base rubro names, upper-cased, "- ANTERIOR"
+#: republication suffixes stripped by normalize_rubro). "normas" is the
+#: declared research scope (user ruling 2026-10-08): every normative
+#: instrument — statutes, decrees (incl. DNU), agency resolutions and
+#: dispositions, instructions, judicial acordadas, treaties. "all" keeps
+#: every listing row (adds official notices, collective bargaining
+#: agreements, job competitions, auctions, union registrations …).
+NORMAS_RUBROS: frozenset[str] = frozenset({
+    "LEYES", "LEGISLACION",
+    "DECRETOS", "DECRETOS DESCLASIFICADOS", "DECISIONES ADMINISTRATIVAS",
+    "RESOLUCIONES", "RESOLUCIONES CONJUNTAS", "RESOLUCIONES GENERALES",
+    "RESOLUCIONES SINTETIZADAS",
+    "DISPOSICIONES", "DISPOSICIONES CONJUNTAS", "DISPOSICIONES SINTETIZADAS",
+    "INSTRUCCIONES PRESIDENCIALES", "INTRUCCIONES GENERALES",  # source spelling
+    "ACORDADAS", "TRATADOS Y CONVENIOS INTERNACIONALES",
+})
+_RUBRO_PRESETS = {"normas": NORMAS_RUBROS, "all": None}
+
+
+def normalize_rubro(raw: str) -> str:
+    """Listing header → canonical base name ('RESOLUCIONES  - ANTERIOR' →
+    'RESOLUCIONES'). Case/spaces folded; the '- ANTERIOR' suffix marks items
+    republicated from an earlier day (doc_id dedup already handles those)."""
+    base = re.sub(r"\s+", " ", raw or "").strip().upper()
+    return re.sub(r"\s*-\s*ANTERIOR\s*$", "", base).strip()
+
+
+def resolve_rubros(raw: Any) -> str:
+    """CLI ``rubros`` value → canonical scope string.
+
+    Accepts a preset alias (``normas`` | ``all``) or an explicit comma list
+    of base names. Returns ``"all"`` (no filter) or a sorted comma string —
+    presets expand to their name list, so the *contents* of a scope, not its
+    alias, are what travels in task params: a scope change means new task
+    identities (widening re-enumerates and re-fetches automatically, and a
+    preset edited later cannot silently drift under old task ids).
+    """
+    value = str(raw if raw is not None else "normas").strip().lower()
+    if value == "all":
+        return "all"
+    preset = _RUBRO_PRESETS.get(value)
+    if preset is not None:
+        return ",".join(sorted(preset))
+    names = {normalize_rubro(part) for part in value.split(",") if part.strip()}
+    if not names:
+        raise _fail(f"rubros must be normas | all | a comma list (got {raw!r})")
+    return ",".join(sorted(names))
+
+
+def cursor_key(rubros_param: str) -> str:
+    """Watermark key per scope: each scope keeps its own cursor, so widening
+    starts a fresh chain while the narrower scope's watermark stands (the
+    identity layer dedups the overlap — 多入口一漏斗). The unfiltered scope
+    keeps the plain historical key."""
+    if rubros_param == "all":
+        return CURSOR_KEY
+    if rubros_param == ",".join(sorted(NORMAS_RUBROS)):
+        return f"{CURSOR_KEY}[normas]"
+    digest = hashlib.md5(rubros_param.encode()).hexdigest()[:6]
+    return f"{CURSOR_KEY}[{digest}]"
+
 
 def _fail(message: str) -> SystemExit:
     return SystemExit(
@@ -98,6 +161,7 @@ def _fail(message: str) -> SystemExit:
         "usage examples:\n"
         "  python cli.py collect --country arg --source bora window=2026-08-28:2026-08-31\n"
         "  python cli.py collect --country arg --source bora sync=1\n"
+        "  python cli.py collect --country arg --source bora window=2026-01-01:2026-12-31 rubros=all\n"
         "  python cli.py status --country arg --source bora"
     )
 
@@ -111,6 +175,8 @@ def _parse_date(raw: str, label: str) -> date:
 
 def start_tasks(params: dict[str, Any]) -> list[TaskSeed]:
     is_sync = str(params.get("sync", "")).strip() in ("1", "true", "yes")
+    rubros = resolve_rubros(params.get("rubros", "normas"))
+    key = cursor_key(rubros)
 
     if params.get("window"):
         window = str(params["window"])
@@ -123,9 +189,12 @@ def start_tasks(params: dict[str, Any]) -> list[TaskSeed]:
             raise _fail(f"window start {from_date} is after its end {to_date}")
     elif is_sync:
         kv = params.get("_kv", {})
-        cursor = kv.get(CURSOR_KEY)
+        cursor = kv.get(key)
         if not cursor:
-            raise _fail("sync=1 needs a previous sweep; run an initial window=… first")
+            raise _fail(
+                "sync=1 needs a previous sweep for this rubros scope; "
+                "run an initial window=… first"
+            )
         from_date = date.fromisoformat(cursor) + timedelta(days=1)
         # Never claim *today*: its edition is generated Buenos Aires-morning
         # and a pre-generation fetch answers like a no-edition day.
@@ -136,7 +205,7 @@ def start_tasks(params: dict[str, Any]) -> list[TaskSeed]:
         raise _fail("give window=FROM:TO or sync=1")
 
     kv = params.get("_kv", {})
-    cursor = kv.get(CURSOR_KEY)
+    cursor = kv.get(key)
     if cursor:
         consumed = date.fromisoformat(cursor)
         if from_date <= consumed:
@@ -148,7 +217,12 @@ def start_tasks(params: dict[str, Any]) -> list[TaskSeed]:
     return [
         TaskSeed(
             type="bora_fecha",
-            params={"date": from_date.isoformat(), "to": to_date.isoformat(), "run": run},
+            params={
+                "date": from_date.isoformat(),
+                "to": to_date.isoformat(),
+                "run": run,
+                "rubros": rubros,
+            },
         )
     ]
 
