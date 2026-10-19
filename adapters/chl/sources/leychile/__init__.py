@@ -46,6 +46,8 @@ Params (key=value on the CLI)::
     years=2024 | 1990,2010 | 1850-2026 | all   required year windows
     pages=1-2        optional register-page range per year
     max_normas=5     optional cap on chl_body spawns per list page
+    items=N          optional page-size override (1..100) for row-window
+                     recovery around server-side serializer bugs
     refresh=<ISO>    repeatable discovery (reopens done list tasks)
 """
 
@@ -125,13 +127,17 @@ def spanish_date_to_iso(text: str) -> str | None:
         return None
 
 
-def list_params(year: int, pg: int) -> dict[str, str]:
+def list_params(year: int, pg: int, items: int = PAGE_SIZE) -> dict[str, str]:
     """buscarjson form fields exactly as the site's own search posts them
     (probed 2026-09-20). ``fc_pb`` must stay year-granular — day-level
     values make the server answer 500; requests' default encoding turns
-    the spaces of '2024 TO 2024' into the literal '+' the API requires."""
+    the spaces of '2024 TO 2024' into the literal '+' the API requires.
+
+    ``items`` (probed 2026-10-07: 50/25/5/1 all honored) is the page-size
+    override for row-window recovery around server-side serializer bugs
+    (see docs/countries/chl/leychile-zh.md section 8)."""
     return {
-        "itemsporpagina": str(PAGE_SIZE),
+        "itemsporpagina": str(items),
         "npagina": str(pg),
         "tipoviene": "1",
         "fc_de": "",
@@ -233,6 +239,20 @@ def start_tasks(params: dict[str, Any]) -> list[TaskSeed]:
         if max_normas < 1:
             raise _fail(f"max_normas must be a positive integer (got {raw_max!r})")
 
+    # Page-size override (serializer-bug recovery, probed 2026-10-07):
+    # with items=N, explicit pages address row windows of N rows instead
+    # of the default 50 — items=1 + pages=2901-2950 recovers the rows of
+    # a broken 50-row page one at a time.
+    items: int | None = None
+    raw_items = str(params.get("items", "")).strip()
+    if raw_items:
+        try:
+            items = int(raw_items)
+        except ValueError:
+            raise _fail(f"items must be an integer 1..100 (got {raw_items!r})") from None
+        if not 1 <= items <= 100:
+            raise _fail(f"items must be an integer 1..100 (got {raw_items!r})")
+
     # Repeatable discovery (same family as KOR refresh): refresh=<timestamp>
     # reopens already-done register pages so a later run finds new normas
     # and new amendments; done body/versions tasks stay skipped.
@@ -256,6 +276,15 @@ def start_tasks(params: dict[str, Any]) -> list[TaskSeed]:
             TaskSeed(
                 type=seed.type,
                 params={**seed.params, "max_normas": max_normas},
+                signal=seed.signal,
+            )
+            for seed in seeds
+        ]
+    if items is not None:
+        seeds = [
+            TaskSeed(
+                type=seed.type,
+                params={**seed.params, "items": items},
                 signal=seed.signal,
             )
             for seed in seeds

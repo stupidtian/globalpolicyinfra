@@ -81,6 +81,14 @@ class ChlBodyHandler:
             raise ValueError(f"body of norma {id_norma} returned HTTP {response.status_code}")
 
         data: Any = response.json()
+        if isinstance(data, dict) and data.get("e") == "not found":
+            # The body endpoint's own not-found envelope (probed 2026-10-07,
+            # norma 900001: HTTP 200 + '{"e":"not found"}' — a listed version
+            # the endpoint declines to serve; data absent at the source).
+            return TaskResult(
+                expected_empty=f"body of norma {id_norma} version "
+                f"{params.get('id_version')} is not served (endpoint: not found)"
+            )
         if not isinstance(data, dict) or "metadatos" not in data or "html" not in data:
             raise ValueError(f"body of norma {id_norma} is not the probed envelope shape")
         meta_in: dict[str, Any] = data["metadatos"]

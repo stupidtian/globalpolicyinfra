@@ -50,6 +50,11 @@ def _norma_row(item: dict[str, Any]) -> dict[str, str]:
     id_norma = str(item.get("IDNORMA", "")).strip()
     if not id_norma:
         raise ValueError("register row carries no IDNORMA")
+    # 15 rows in the 2000-2025 corpus (observed 2026-10-09) arrive with
+    # TIPOVERSION null — str(None) would store a literal "None"; empty
+    # string keeps the column clean (anchor spawn treats it as amended,
+    # the defensive branch).
+    raw_tipo = item.get("TIPOVERSION")
     return {
         "id_norma": id_norma,
         "norma_name": item.get("NORMA") or item.get("COMPUESTO") or f"Norma {id_norma}",
@@ -62,15 +67,16 @@ def _norma_row(item: dict[str, Any]) -> dict[str, str]:
         "fecha_publicacion": spanish_date_to_iso(item.get("FECHA_PUBLICACION", "")) or "",
         "fecha_derogacion": spanish_date_to_iso(item.get("FECHA_DEROGACION", "")) or "",
         "current_vigencia": item.get("FECHA_VIGENCIA") or "",
-        "tipo_version": str(item.get("TIPOVERSION", "")).strip(),
+        "tipo_version": str(raw_tipo).strip() if raw_tipo is not None else "",
     }
 
 
 class ChlListHandler:
     def build_request(self, task: TaskView) -> RequestSpec:
+        items = int(task.params["items"]) if "items" in task.params else PAGE_SIZE
         return RequestSpec(
             url=f"{API_BASE}/buscarjson",
-            params=list_params(int(task.params["year"]), int(task.params["pg"])),
+            params=list_params(int(task.params["year"]), int(task.params["pg"]), items),
         )
 
     def parse(self, response: Response, task: TaskView) -> TaskResult:
@@ -122,7 +128,8 @@ class ChlListHandler:
             anchors = anchors[:cap]
 
         next_tasks = list(anchors)
-        full_page = len(rows) >= PAGE_SIZE
+        items = int(params["items"]) if "items" in params else PAGE_SIZE
+        full_page = len(rows) >= items
         if full_page and not capped and params.get("walk"):
             next_tasks.append(
                 TaskSeed(
