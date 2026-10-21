@@ -120,6 +120,15 @@ def build_parser() -> argparse.ArgumentParser:
         "Runtime-only — never stored in task params or the ledger",
     )
     clean_parser.add_argument(
+        "--meta", action="append", default=None, metavar="KEY=V1,V2",
+        help="Seed only documents whose meta JSON carries KEY with one of "
+        "the given values, e.g. --meta nature=LOI,DECRET (document-category "
+        "scoping, framework-clean-scope 2026-10-09). Repeatable (keys AND "
+        "together); runtime-only — it narrows seeding and never touches "
+        "task params or the ledger, so an unfiltered later run seeds the "
+        "remainder",
+    )
+    clean_parser.add_argument(
         "--dry-run", action="store_true",
         help="Show what would be seeded and what is already due; nothing enqueued or cleaned",
     )
@@ -208,6 +217,21 @@ def build_parser() -> argparse.ArgumentParser:
         help="Execute the repair (default: dry run)",
     )
     dnk_mainfile_parser.add_argument(
+        "--config-file", default=None,
+        help="Explicit config file location (default: ~/.globalpolicyinfra/config.toml).",
+    )
+
+    isl_mainfile_parser = subparsers.add_parser(
+        "repair-isl-mainfile",
+        help=("One-time ISL repair: point documents.local_path at the PDF body "
+              "carrier for stub-HTML fallback docs (clean-probe/clean-plan.md)."),
+    )
+    isl_mainfile_parser.add_argument("--country", default="isl", help="ISO3 code (isl)")
+    isl_mainfile_parser.add_argument(
+        "--apply", action="store_true",
+        help="Execute the repair (default: dry run)",
+    )
+    isl_mainfile_parser.add_argument(
         "--config-file", default=None,
         help="Explicit config file location (default: ~/.globalpolicyinfra/config.toml).",
     )
@@ -374,6 +398,19 @@ def _run_clean(args: argparse.Namespace) -> int:
     if args.api_pages is not None and args.api_pages < 0:
         print("error: --api-pages must be >= 0", file=sys.stderr)
         return 2
+    meta_filter: dict[str, list[str]] | None = None
+    if args.meta:
+        meta_filter = {}
+        for item in args.meta:
+            key, sep, values = item.partition("=")
+            split_values = [v.strip() for v in values.split(",") if v.strip()]
+            if not sep or not key.strip() or not split_values:
+                print(
+                    f"error: --meta must look like KEY=V1,V2 (got {item!r})",
+                    file=sys.stderr,
+                )
+                return 2
+            meta_filter[key.strip()] = split_values
     try:
         data_root = resolve_data_root(config_path=args.config_file)
     except ConfigError as exc:
@@ -430,6 +467,7 @@ def _run_clean(args: argparse.Namespace) -> int:
                     pairs = store.clean_pending_targets(
                         decl.targets, _clean_version_threshold(source, decl),
                         clean_type=_clean_skip_type(source, decl),
+                        meta_filter=meta_filter,
                     )
                     if args.limit is not None:
                         pairs = pairs[: args.limit]
@@ -460,6 +498,7 @@ def _run_clean(args: argparse.Namespace) -> int:
                 pairs = store.clean_pending_targets(
                     decl.targets, _clean_version_threshold(source, decl),
                     clean_type=_clean_skip_type(source, decl),
+                    meta_filter=meta_filter,
                 )
                 if args.limit is not None:
                     pairs = pairs[: args.limit]
@@ -906,6 +945,109 @@ def _run_repair_dnk_mainfile(args: argparse.Namespace) -> int:
         return 0
 
 
+# -- repair-isl-mainfile (one-time, ISL 2026-09-30 mainfile/carrier alignment) ----------
+#
+# DEVIATION (same family as migrate-layout / repair-dnk-mainfile): bulk documents-row
+# UPDATE outside the write_batch path, per clean-plan.md (user-approved 2026-09-30).
+# Eligible rows: meta.files names doc.pdf (the body carrier of digitisation-stub
+# fallback docs), local_path still ends in doc.html (the stub), and the PDF exists
+# on disk. After the repair the main-file pointer IS the body carrier; the stub
+# doc.html stays recorded as a meta.files sibling. Per-row events; idempotent
+# (repaired rows match nothing on a second run). 44/2004 (pdfUrl delivered a Word
+# file, no PDF on disk) is structurally excluded — it keeps its stub primary and
+# fails loudly in cleaning.
+
+def _run_repair_isl_mainfile(args: argparse.Namespace) -> int:
+    import hashlib
+    import json as _json
+    from datetime import UTC as _UTC
+    from datetime import datetime as _dt
+
+    try:
+        data_root = resolve_data_root(config_path=args.config_file)
+    except ConfigError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    country = args.country.upper()
+    country_root = paths.country_dir(data_root, country)
+    with StateStore.for_country(data_root, country) as store:
+        conn = store.connection
+        rows = conn.execute(
+            "SELECT doc_id, local_path, meta FROM documents "
+            "WHERE local_path LIKE '%/doc.html' AND meta LIKE '%doc.pdf%'"
+        ).fetchall()
+        plan: list[tuple[str, str, str, str]] = []
+        skipped_missing_disk = 0
+        for row in rows:
+            meta: dict[str, str] = _json.loads(row["meta"]) if row["meta"] else {}
+            if "doc.pdf" not in (meta.get("files") or "").split(","):
+                continue
+            new_path = row["local_path"][: -len("doc.html")] + "doc.pdf"
+            if not (country_root / new_path).exists():
+                skipped_missing_disk += 1
+                continue
+            plan.append((row["doc_id"], row["local_path"], new_path, row["meta"]))
+        print(f"[{country}] mainfile repair plan: {len(plan)} row(s) -> doc.pdf carrier"
+              + (f" ({skipped_missing_disk} skipped: pdf missing on disk)" if skipped_missing_disk else ""))
+        for doc_id, _old, new, _meta in plan[:3]:
+            print(f"  e.g. {doc_id}: -> {new}")
+        if not plan:
+            print("  nothing to do (already repaired)")
+            return 0
+        if not args.apply:
+            print("dry run — pass --apply to execute")
+            return 0
+
+        with store.transaction() as tx:
+            for doc_id, old_path, pdf_path, meta_json in plan:
+                data = (country_root / pdf_path).read_bytes()
+                meta = _json.loads(meta_json) if meta_json else {}
+                siblings = [s for s in (meta.get("files") or "").split(",") if s]
+                meta["files"] = ",".join(
+                    "doc.html" if s == "doc.pdf" else s for s in siblings
+                )
+                tx.execute(
+                    "UPDATE documents SET local_path = ?, file_hash = ?, "
+                    "content_length = ?, raw_format = 'pdf', meta = ? "
+                    "WHERE doc_id = ?",
+                    (
+                        pdf_path,
+                        hashlib.sha256(data).hexdigest(),
+                        len(data),
+                        _json.dumps(meta, ensure_ascii=False, sort_keys=True),
+                        doc_id,
+                    ),
+                )
+                tx.execute(
+                    "INSERT INTO events (ts, entity_type, subject_id, stage, "
+                    "from_status, to_status, detail) VALUES (?, 'document', ?, "
+                    "'repair-isl-mainfile', ?, ?, ?)",
+                    (
+                        _dt.now(_UTC).isoformat().replace("+00:00", "Z"),
+                        doc_id,
+                        old_path,
+                        pdf_path,
+                        (
+                            "main-file pointer -> doc.pdf body carrier (stub doc.html "
+                            "kept as meta.files sibling; see clean-plan.md)"
+                        ),
+                    ),
+                )
+            tx.execute(
+                "INSERT INTO events (ts, entity_type, subject_id, stage, "
+                "from_status, to_status, detail) VALUES (?, 'documents', "
+                "'repair-isl-mainfile', NULL, NULL, 'applied', ?)",
+                (
+                    _dt.now(_UTC).isoformat().replace("+00:00", "Z"),
+                    f"main-file pointer -> doc.pdf on {len(plan)} fallback rows "
+                    + "(doc.html kept as meta.files sibling; see clean-plan.md)",
+                ),
+            )
+        print(f"[{country}] mainfile repair applied: {len(plan)} row(s) rewritten "
+              "in one transaction")
+        return 0
+
+
 def _run_events_archive(args: argparse.Namespace) -> int:
     try:
         data_root = resolve_data_root(config_path=args.config_file)
@@ -964,6 +1106,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         return _run_migrate_layout(args)
     if args.command == "repair-dnk-mainfile":
         return _run_repair_dnk_mainfile(args)
+    if args.command == "repair-isl-mainfile":
+        return _run_repair_isl_mainfile(args)
     if args.command == "events-archive":
         return _run_events_archive(args)
     parser.print_help()

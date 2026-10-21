@@ -478,6 +478,7 @@ class StateStore:
     def clean_pending_targets(
         self, targets: Sequence[str], version: int, *,
         clean_type: str | None = None,
+        meta_filter: Mapping[str, Sequence[str]] | None = None,
     ) -> list[tuple[str, str]]:
         """doc_ids whose producing task type is in ``targets`` and which
         have no ``cleaned`` row at ``version`` or newer — the cleaning seed
@@ -494,22 +495,45 @@ class StateStore:
         when ``version`` is the bare seed version (true for non-PDF
         sources; PDF sources do not pass ``clean_type`` — their re-seeding
         is the MinerU page-budget deferral channel, #37 plan ④).
+
+        With ``meta_filter`` (framework-clean-scope 2026-10-09, runtime-only
+        like ``--delay``/``--workers``): only documents whose ``meta`` JSON
+        carries ``key`` with one of the given values are seeded — the scope
+        selector for corpora where document categories differ in cleaning
+        value (FRA: normative texts vs gazette notices). Multiple keys AND
+        together; documents without the key (or JSON NULL) never match; an
+        empty values list matches nothing. The filter narrows seeding only —
+        task params and the ledger are untouched, so a later unfiltered run
+        simply seeds the remainder.
         """
         if not targets:
             return []
         placeholders = ", ".join("?" for _ in targets)
+        fragments = [f"t.type IN ({placeholders})", "d.local_path IS NOT NULL"]
+        params: list[Any] = [*targets]
+        if meta_filter:
+            for key, values in meta_filter.items():
+                if not values:
+                    return []  # IN () — the strict empty-set match
+                value_ph = ", ".join("?" for _ in values)
+                fragments.append(f"json_extract(d.meta, '$.{key}') IN ({value_ph})")
+                params.extend(values)
+        # NOT EXISTS last: its version placeholder is appended after the
+        # meta values so params order matches the SQL text order
+        fragments.append(
+            "NOT EXISTS (SELECT 1 FROM cleaned c "
+            "WHERE c.doc_id = d.doc_id AND c.version >= ?)"
+        )
+        params.append(version)
+        where = " AND ".join(fragments)
         rows = self._conn.execute(
             f"""
             SELECT d.doc_id, t.type FROM documents d
             JOIN tasks t ON t.task_id = d.produced_by
-            WHERE t.type IN ({placeholders}) AND d.local_path IS NOT NULL
-              AND NOT EXISTS (
-                  SELECT 1 FROM cleaned c
-                  WHERE c.doc_id = d.doc_id AND c.version >= ?
-              )
+            WHERE {where}
             ORDER BY d.doc_id
             """,
-            (*targets, version),
+            params,
         ).fetchall()
         pairs = [(row["doc_id"], row["type"]) for row in rows]
         if clean_type is None:
