@@ -138,12 +138,17 @@ class HttpTransport:
                         timeout=self.timeout,
                     )
                 elif method == "POST":
-                    # json_body=None keeps a bodyless POST; a dict is sent as
-                    # the JSON body (first consumer: DNK retsinformation's
-                    # documentHtml endpoint, 2026-09-16).
+                    # One body per request: json_body=None keeps a bodyless
+                    # POST; a dict json_body is sent as JSON (first consumer:
+                    # DNK retsinformation, 2026-09-16); a form_body mapping
+                    # goes to requests' native urlencoding with its
+                    # Content-Type (first consumer: IND egazette's ASP.NET
+                    # PostBack, framework-form-body 2026-10-15). Construction
+                    # guards keep json_body and form_body mutually exclusive.
                     response = session.post(
                         url,
                         params=params or None,
+                        data=spec.form_body,
                         json=spec.json_body,
                         headers=headers or None,
                         timeout=self.timeout,

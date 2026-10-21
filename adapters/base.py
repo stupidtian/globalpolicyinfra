@@ -15,7 +15,7 @@ no sqlite, no file writes, no browser — all I/O belongs to the framework.
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
@@ -109,6 +109,21 @@ class RequestSpec:
     Same discipline as ``key_env``: only the variable's NAME travels here —
     the value is read at the last moment and never enters params, the
     ledger, or logs.
+
+    ``form_body`` (2026-10-15, framework-form-body; first consumer IND
+    egazette's ASP.NET PostBack): the urlencoded form body of a POST —
+    a mapping such as ``__VIEWSTATE``/``__EVENTVALIDATION`` plus the form
+    fields. Symmetric with ``json_body`` (DNK 2026-09-16 precedent): one
+    body per request — setting both is a loud ValueError, and ``form_body``
+    requires an explicit ``method="POST"`` (the framework never rewrites
+    the declared method). The transport hands the mapping to requests'
+    native urlencoding (no manual joining — double-encoding pitfall).
+    Accounting discipline: **page state must never enter task params** —
+    task identity is the (type, params) tuple, and a ``__VIEWSTATE`` in
+    params would pollute identity (every response replays as a "new"
+    task); the value is public page state, not a secret, but like every
+    key material it belongs in the request, never in params or the
+    ledger.
     """
 
     url: str = ""
@@ -123,6 +138,23 @@ class RequestSpec:
     json_body: dict[str, Any] | None = None
     local_doc: str | None = None
     key_header: str | None = None
+    form_body: Mapping[str, str] | None = None
+
+    def __post_init__(self) -> None:
+        # Loud construction-time guards (framework-form-body 2026-10-15):
+        # one body per request, and a form body is a POST body — both
+        # misdeclarations die here, not as a silent 4xx at 3 a.m.
+        if self.form_body is not None and self.json_body is not None:
+            raise ValueError(
+                "RequestSpec: form_body and json_body are mutually exclusive "
+                "(one request carries one body)"
+            )
+        if self.form_body is not None and self.method.upper() != "POST":
+            raise ValueError(
+                "RequestSpec: form_body requires an explicit method='POST' "
+                f"(got {self.method!r}; the framework never rewrites the "
+                "declared method)"
+            )
 
 
 @dataclass(frozen=True)
