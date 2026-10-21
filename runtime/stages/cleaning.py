@@ -456,11 +456,18 @@ def _iter_elements(obj: object) -> Iterator[object]:
             yield from _iter_elements(child)
 
 
-def _page_chars(page: LTPage) -> list[LTChar]:
+def _page_chars(
+    page: LTPage, max_char_height: float | None = None
+) -> list[LTChar]:
+    """All text chars of one page (deep walk). ``max_char_height`` is the
+    pre-assembly char-level filter shared by the vertical and horizontal
+    paths — one implementation, applied where chars are collected."""
     return [
         el
         for el in _iter_elements(page)
-        if isinstance(el, LTChar) and el.get_text().strip()
+        if isinstance(el, LTChar)
+        and el.get_text().strip()
+        and (max_char_height is None or el.height <= max_char_height)
     ]
 
 
@@ -537,10 +544,12 @@ def _norm_repeats(text: str) -> str:
     return re.sub(r"\d+", "#", _WHITESPACE_RUN.sub(" ", text)).strip()
 
 
-def _vertical_page_text(page: LTPage) -> list[str]:
+def _vertical_page_text(
+    page: LTPage, max_char_height: float | None = None
+) -> list[str]:
     """Assemble one tategaki page: chars group into x-band columns,
     columns read right-to-left, lines top-down, runs broken on y-gaps."""
-    chars = _page_chars(page)
+    chars = _page_chars(page, max_char_height)
     xs = sorted({round(c.x0) for c in chars})
     bands: list[list[int]] = []
     for x in xs:
@@ -570,12 +579,14 @@ def _vertical_page_text(page: LTPage) -> list[str]:
     return out
 
 
-def _horizontal_pages_text(pages: list[LTPage]) -> list[list[str]]:
+def _horizontal_pages_text(
+    pages: list[LTPage], max_char_height: float | None = None
+) -> list[list[str]]:
     """Assemble horizontal pages: shared header/footer removed (lines whose
     digit-normalized text repeats on >= max(3, 60% of pages)), columns
     ordered by x0 modes with full-width lines first. Returns the line list
     per input page (same order, same count)."""
-    page_lines = [_assemble_lines(_page_chars(p)) for p in pages]
+    page_lines = [_assemble_lines(_page_chars(p, max_char_height)) for p in pages]
     n_pages = max(1, len(page_lines))
     counter: Counter[str] = Counter(
         _norm_repeats(t) for lines in page_lines for _, _, _, t in lines if t
@@ -657,7 +668,9 @@ def measure_pdf(data: bytes) -> dict[str, float | int]:
     }
 
 
-def geometry_pdf_to_text(data: bytes) -> str:
+def geometry_pdf_to_text(
+    data: bytes, *, max_char_height: float | None = None
+) -> str:
     """Local geometry channel (pdfminer.six): PDF bytes → deterministic
     UTF-8 plain text. Per-page vertical/horizontal detection (Japanese
     gazettes mix tategaki and horizontal on facing pages); horizontal
@@ -665,18 +678,32 @@ def geometry_pdf_to_text(data: bytes) -> str:
     output contract identical to :func:`html_to_text` (\\n only, no BOM,
     exactly one trailing newline, same bytes for same input).
 
+    ``max_char_height``: char-level filter applied **before assembly**
+    (chars taller than it never reach line grouping, in both the vertical
+    and horizontal paths). For "masthead in big type" gazette layouts —
+    the JPN/KR-style convention — the masthead chars otherwise scatter
+    into body columns and glue onto body lines, which text-level line
+    rules cannot undo (JPN P0: 11/24 probe samples glued). The JPN value
+    9.5 comes from its P0 height invariant (body uniformly h5–9,
+    masthead h10/12/14 — 23/23 samples), not an eyeballed threshold.
+    Default ``None`` = no filtering; existing callers byte-identical.
+
     Structurally broken PDFs raise (pdfminer parse errors propagate) —
     the engine classifies unknown exceptions as needs_agent, which is the
     loud outcome a corrupt file deserves.
     """
     pages = list(extract_pages(io.BytesIO(data), laparams=LAParams()))
-    vertical_flags = [_vertical_share(_page_chars(p)) >= 0.5 for p in pages]
+    vertical_flags = [
+        _vertical_share(_page_chars(p, max_char_height)) >= 0.5 for p in pages
+    ]
     horizontal_pages = [p for p, v in zip(pages, vertical_flags) if not v]
-    horizontal_per_page = iter(_horizontal_pages_text(horizontal_pages))
+    horizontal_per_page = iter(
+        _horizontal_pages_text(horizontal_pages, max_char_height)
+    )
     lines: list[str] = []
     for page, is_vertical in zip(pages, vertical_flags):
         if is_vertical:
-            lines.extend(_vertical_page_text(page))
+            lines.extend(_vertical_page_text(page, max_char_height))
         else:
             lines.extend(next(horizontal_per_page))
         lines.append("")  # page boundary
