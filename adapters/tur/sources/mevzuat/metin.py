@@ -94,10 +94,10 @@ _DATE = r"(\d{1,2})[/.](\d{1,2})[/.](\d{4})"
 #: gazette line prefix up to the date — tolerates ": Tarih :", "nin Tarihi :",
 #: " Tarihi: ", "nin Tarihi - Sayısı :" (tur 19) inside ~40 non-digits.
 _RG_DATE_RE = re.compile(
-    rf"Yay[ıi]mland[ıi][ğg][ıi]\s*Resm[îi]\s*Gazete(?:nen)?[^\d]{{0,40}}{_DATE}"
+    rf"Yay[ıi]mland[ıi][ğg][ıi]\s*(?:Resm[îi]\s*Gazete(?:nen)?|R\.G\.)[^\d]{{0,40}}{_DATE}"
 )
 #: adoption line — "Kabul Tarihi", "… Kararının/Kararnamenin Tarihi"
-_KABUL_RE = re.compile(rf"(?:Kabul|Karar[ıi]n[ıi]n|Kararnamenin)\s*Tarih[ıi]\s*:\s*{_DATE}")
+_KABUL_RE = re.compile(rf"(?:Kabul|Karar[ıi]n[ıi]n|Kararnamenin|Kar\.\s*nin)\s*Tarih[ıi]\s*:\s*{_DATE}")
 #: identity number on the adoption line ("No : 2013/5150" / "Sayısı:11674")
 _ADOPTION_NO_RE = re.compile(r"(?:No|Say[ıi]s[ıi])\s*:\s*([\d/]+)")
 _KANUN_NO_RE = re.compile(r"Kanun\s*Numaras[ıi]\s*:\s*(\d+)")
@@ -192,10 +192,15 @@ class MevMetinHandler:
             key in found
             for key in ("kanun_no", "kararname_no", "kabul_tarihi", "rg_tarihi")
         )
-        if not has_header and tur not in HEADERLESS_TURS:
+        # headerless full texts are a real shape (probed: tur 7/8 bodies
+        # start straight at the articles; tur 9 tebliğ likewise; the probed
+        # KHR 631 uses the compressed "Kar. nin / R.G." dialect). A thin
+        # body without articles is the failure mode worth catching
+        # (session-error pages) — fail only that.
+        if not has_header and "MADDE" not in text and len(text) < 1000:
             raise ValueError(
                 f"mev_metin tur={tur} no={no}: body carries no recognizable "
-                f"header block ({len(response.content)} bytes)"
+                f"header and no article text ({len(response.content)} bytes)"
             )
         for key, label in (("kanun_no", "statute"), ("kararname_no", "decree")):
             if found.get(key) and found[key] != no:
@@ -203,10 +208,11 @@ class MevMetinHandler:
                     f"mev_metin no={no}: header numbers {label} {found[key]}"
                 )
         if seed_rg and found.get("rg_tarihi") and found["rg_tarihi"] != seed_rg:
-            raise ValueError(
-                f"mev_metin tur={tur} no={no}: header gazette date "
-                f"{found['rg_tarihi']} contradicts catalogue {seed_rg}"
-            )
+            # the registry's own catalogue and text occasionally disagree
+            # (probed: 18 instances across tur 1/3/4/21). The seed's
+            # catalogue date owns the identity; the header value rides in
+            # meta for the analysis side rather than failing the document.
+            found["header_rg_tarihi"] = found.pop("rg_tarihi")
 
         meta: dict[str, str] = {"mevzuat_tur": str(tur), "mevzuat_tertip": str(tertip)}
         for key in (
@@ -215,6 +221,7 @@ class MevMetinHandler:
             "karar_no",
             "kabul_tarihi",
             "rg_sayisi",
+            "header_rg_tarihi",
             "dayandigi_kanun_tarihi",
             "dayandigi_kanun_no",
             "dustur_tertip",

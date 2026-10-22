@@ -83,7 +83,10 @@ KNOWN_TURS: frozenset[int] = frozenset({0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 16, 17
 
 #: User-ruled default (2026-09-28): core legislative types + full
 #: Yönetmelik family (3 = the union of 7/8/10).
-DEFAULT_TURS = "1,2,3,4,5,9,19,20,21"
+# 3 (the Yönetmelik union) paginates with mixed-type drift server-side;
+# its clean subtypes 7/8 are walked instead; 10 (148 records) is answered
+# with type-3 rows — unreachable until the server fixes the code (2026-10-15).
+DEFAULT_TURS = "1,2,4,5,7,8,9,19,20,21"
 
 _TR_DOTS_RE = re.compile(r"^(\d{1,2})[.](\d{1,2})[.](\d{4})$")
 
