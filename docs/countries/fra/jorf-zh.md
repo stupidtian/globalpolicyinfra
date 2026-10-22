@@ -165,18 +165,18 @@ python cli.py requeue --country fra
 
 ## 7. 更新与增量
 
-- **游标**：`jorf_last_date`。每个 `jorf_issue` 完成**自己那一天**才把游标推到该日——中途崩溃不会跳过未完成的日期；当天早包尚未生成（约巴黎时间 00:25 前）则该日无任务、游标不动，下次 sync 自愈。
+- **历史已回填**：1990-01-01 → 2025-07-13 共 **978,975 份文档**已入账（2026-10-09 回填；机制与过程见 [backfill-report](../../tasks/2026-08-28-fra/backfill-report.md)：全量 stock 切成与每日增量同构的按日包，本地服务供给，引擎 `base=` 参数照常按天抓）。1982–1989 的按日包亦已备好，扩围只需改窗口参数。
+- **追平"现在"**：回填后游标 `jorf_last_date` 停在 2025-07-13；`python cli.py collect --country fra --source jorf sync=1`（不带 base）即从在线目录把 2025-07-14 → 今天的每日增量追平，此后日常 sync 即可。
+- **游标**：每个 `jorf_issue` 完成**自己那一天**才把游标推到该日——中途崩溃不会跳过未完成的日期；当天早包尚未生成（约巴黎时间 00:25 前）则该日无任务、游标不动，下次 sync 自愈。
 - **抓的是不可变快照**：早包在生成时刻就冻结（§1.3），今天下载和一年后下载字节相同；重复运行同窗口安全（任务确定性去重，已抓直接跳过）。
 - **文本刊出即定，无重开机制**：法国规矩是修正走新文本（新 id、新期），旧文本原文永不改；改的只是元数据层（ELI/关键词/反向引用），且只体现在晚包 diff 里——本源不设更新信号，同德国冻结档案的处理。
-- 往更早日期回填会把游标往回带，下次 sync 多扫一段，幂等无害（与 usa/regulations 同判例）。
-- 2025-07-13 之前的日期在增量目录里不存在，抓不到也不应去抓——历史走 stock（§8）。
 
 ## 8. 已知边界与缺口
 
 | 缺口 | 说明 |
 |---|---|
 | **晚包（维护 diff）不抓** | 出版后补的 ELI、SGG 关键词（mots-clés）、反向引用不进库——口径是 as-published（§1.3）。需要"增补态"时走晚包 diff 或年度 stock 幂等刷新，属后续扩展 |
-| **历史回填（1990–2025-07-12）** | 增量目录只从 2025-07-13 起。历史在 1.6 GB 全量 stock（官方每年至少重出一个，含旧 stock+期间全部维护），需专门的下载与解包策略，另行立项 |
+| **尾部增量（2025-07-14 起）** | 每日增量目录覆盖这一段，`sync=1` 追平即可（§7）；截至 2026-10-09 库内已含 2026-08-26/27 两期（在线试点） |
 | section_ta / eli 不落盘 | 章节结构树与 ELI 映射文件不抓。正文完整性不受影响（article 自包含）；ELI URL 若研究需要，可日后从 eli/ 文件补映射 |
 | 停刊日与周一 | 周一无"法律与法令"版（只有维护 diff 包）、节日可能全无文件：这些日期不生成任务，属正常；索引侧靠"正午前生成"判别期包，解析侧另有"文本出版日 = 任务日"安全网兜底 |
 | 同日二次推送 | 个别日期有正午前的重推包（全库一年仅 1 例 07:04 与 9 例午后文件）：取的是**最早**一期包，重推内容不追（其变动最终体现在维护 diff 里，见上条边界） |
@@ -195,7 +195,7 @@ python cli.py requeue --country fra
 | 文本正门 URL（source_url 基底） | `https://www.legifrance.gouv.fr/jorf/id/{JORFTEXT id}`（浏览器可开；采集不走此通道） |
 | Légifrance API（未用） | token `https://oauth.piste.gouv.fr/api/oauth/token`（OAuth2 client_credentials）→ `https://api.piste.gouv.fr/dila/legifrance/...` |
 
-**NATURE 词表**（meta.nature 观测值）：LOI / ORDONNANCE / DECRET / ARRETE / AVIS / DECISION / INFORMATIONS_PARLEMENTAIRES / ANNONCES（一天实测即此八种；stock 里另有老类别，解析不做白名单限制）。
+**NATURE 词表**（meta.nature 原值，2026-10-09 全库 97.9 万文档普查）：主体为 LOI / ORDONNANCE / DECRET / ARRETE（规范类 73.2%），其余 26.8% 为公告信息类——AVIS（12.3%）、DECISION（8.5%，机构决定/签字委托/授权裁决等）、INFORMATIONS_PARLEMENTAIRES（2.1%）、RESULTATS（1.5%，竞赛/选举结果）、DELIBERATION（0.7%，CNIL 等机构审议）、LISTE、ANNONCES（改名启事等）等；另有 DIRECTIVE_EURO / AVISEURO / DECISION_EURO 等 EU 通讯类（1990 年代多见，EU 法令的法文译刊）。全库共 80+ 个原值，解析不做白名单限制，过滤研究请直接按 nature 列筛选。
 
 ---
 

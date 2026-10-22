@@ -124,4 +124,7 @@ def build_source() -> SourceDefinition:
             "jorf_index": JorfIndexHandler(),
             "jorf_issue": JorfIssueHandler(),
         },
+        # keyless and sessionless: every task is an independent request, so
+        # any worker may run any task (framework-concurrency ruling 1.4)
+        parallel_safe=True,
     )
