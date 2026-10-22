@@ -79,12 +79,14 @@ Params (key=value on the CLI)::
 
 from __future__ import annotations
 
+import json
 from datetime import UTC, date, datetime, timedelta
 from typing import Any
 
-from adapters.base import SourceDefinition, TaskSeed
+from adapters.base import CleanDefinition, SourceDefinition, TaskSeed
 
 __all__ = [
+    "CLEAN_VERSION",
     "CURSOR_KEY",
     "FRESH_ROOT_DAYS",
     "LAW_SECTIONS",
@@ -96,6 +98,10 @@ __all__ = [
 ]
 
 SITE = "https://www.kanpo.go.jp"
+
+#: Cleaning-rule version (clean-plan §2.1); stored versions carry the
+#: PDF ×100 fingerprint encoding, so v1 geometry output records as 100.
+CLEAN_VERSION = 1
 
 #: Polite-crawl identity (user decision 2026-09-08): honest research UA
 #: pointing at the open-source repo — the portal's robots.txt closes the
@@ -132,6 +138,12 @@ LAW_SECTIONS = frozenset(
         "条約",
         "詔書",
         "日本国憲法改正",
+        # Reconstruction Agency ordinances (agency existed 2012–2024; the
+        # gazette's section word for its orders). Added 2026-10-18 by user
+        # ruling after the vocabulary gap surfaced via the span backfill —
+        # previously such entries (and their composites 府令・復興庁令・省令)
+        # were silently outside the default scope.
+        "復興庁令",
     }
 )
 
@@ -143,6 +155,7 @@ def _fail(message: str) -> SystemExit:
         "  python cli.py collect --country jpn --source kanpo window=2026-09-01:2026-09-06\n"
         "  python cli.py collect --country jpn --source kanpo sync=1\n"
         "  python cli.py collect --country jpn --source kanpo months=2003-07:2003-12\n"
+        "  python cli.py collect --country jpn --source kanpo spans=1\n"
         "  python cli.py collect --country jpn --source kanpo window=2026-09-01:2026-09-06 sections=all\n"
         "  python cli.py status --country jpn --source kanpo"
     )
@@ -205,11 +218,42 @@ def start_tasks(params: dict[str, Any]) -> list[TaskSeed]:
     injected = params.get("_today")  # test seam; the engine never passes it
     today = injected if isinstance(injected, date) else datetime.now(UTC).date()
 
-    modes = [m for m in ("window", "sync", "months") if params.get(m)]
+    modes = [m for m in ("window", "sync", "months", "spans") if params.get(m)]
     if len(modes) != 1:
-        raise _fail("give exactly one of window=FROM:TO, sync=1 or months=YYYY-MM:YYYY-MM")
+        raise _fail(
+            "give exactly one of window=FROM:TO, sync=1, months=YYYY-MM:YYYY-MM "
+            "or spans=1"
+        )
 
     seeds: list[TaskSeed] = []
+    if params.get("spans"):
+        # Continuation-page backfill (gap found 2026-10-15): seeds one
+        # kanpo_span_issue per h/g/t issue from the ledger-derived kv
+        # manifest (docs/tasks/2026-09-02-jpn/span_manifest.py writes it).
+        manifest_raw = params.get("_kv", {}).get("kanpo_span_manifest")
+        if not manifest_raw:
+            raise _fail(
+                "spans=1 needs the kv manifest kanpo_span_manifest — run "
+                "python docs/tasks/2026-09-02-jpn/span_manifest.py first"
+            )
+        try:
+            manifest: dict[str, dict[str, str]] = json.loads(manifest_raw)
+        except json.JSONDecodeError as exc:
+            raise _fail(f"kanpo_span_manifest is not valid JSON: {exc}") from None
+        return [
+            TaskSeed(
+                type="kanpo_span_issue",
+                params={
+                    "issue": code,
+                    "rev": info["rev"],
+                    "date": info["date"],
+                    "ns": info["ns"],
+                    "fetched": info["fetched"],
+                },
+            )
+            for code, info in manifest.items()
+        ]
+
     if params.get("window"):
         window = str(params["window"])
         from_str, sep, to_str = window.partition(":")
@@ -282,13 +326,28 @@ def start_tasks(params: dict[str, Any]) -> list[TaskSeed]:
 
 
 def build_source() -> SourceDefinition:
+    from adapters.jpn.sources.kanpo.clean import KanpoCleanHandler
     from adapters.jpn.sources.kanpo.document import KanpoDocHandler
     from adapters.jpn.sources.kanpo.enumerate import (
         KanpoDayHandler,
         KanpoIssueHandler,
         KanpoMonthHandler,
     )
+    from adapters.jpn.sources.kanpo.spans import (
+        KanpoPageHandler,
+        KanpoSpanIssueHandler,
+    )
 
+    clean = CleanDefinition(
+        task_type="kanpo_clean",
+        version=CLEAN_VERSION,
+        # kanpo_page docs are continuation pages of kanpo_doc entries —
+        # same PDF shapes, same cleaning rules.
+        targets=("kanpo_doc", "kanpo_page"),
+        # pdf_rules intentionally empty: the whole corpus is digital-native
+        # single-page gazette pages (P0 + framework #37 corpus scan) —
+        # everything routes to the local geometry channel.
+    )
     return SourceDefinition(
         name="kanpo",
         start_tasks=start_tasks,
@@ -297,7 +356,11 @@ def build_source() -> SourceDefinition:
             "kanpo_month": KanpoMonthHandler(),
             "kanpo_issue": KanpoIssueHandler(),
             "kanpo_doc": KanpoDocHandler(),
+            "kanpo_span_issue": KanpoSpanIssueHandler(),
+            "kanpo_page": KanpoPageHandler(),
+            "kanpo_clean": KanpoCleanHandler(clean),
         },
+        clean=clean,
         # Stateless GETs end to end (no cookies, no tokens — probed
         # 2026-09-07); any task may run on any worker with any session.
         parallel_safe=True,

@@ -80,7 +80,18 @@ _MONTH_LINK_RE = re.compile(
 _BASE_RE = re.compile(r"^(\d{8}[a-z]\d+\d{4})f\.html$")
 
 _ORDINANCE_PARTS = frozenset(
-    {"府令", "省令", "庁令", "内閣官房令", "内閣府令", "デジタル庁令", "内閣総理府令"}
+    {
+        "府令",
+        "省令",
+        "庁令",
+        "内閣官房令",
+        "内閣府令",
+        "デジタル庁令",
+        "内閣総理府令",
+        # composite-capable since 2012 (e.g. 府令・復興庁令・省令 blocks);
+        # added 2026-10-18 with the 復興庁令 vocabulary fix
+        "復興庁令",
+    }
 )
 
 
