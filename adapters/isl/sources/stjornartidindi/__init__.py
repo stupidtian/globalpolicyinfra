@@ -70,7 +70,7 @@ from __future__ import annotations
 from datetime import UTC, date, datetime, timedelta
 from typing import Any
 
-from adapters.base import SourceDefinition, TaskSeed
+from adapters.base import CleanDefinition, SourceDefinition, TaskSeed
 
 __all__ = [
     "API_BASE",
@@ -282,10 +282,16 @@ def start_tasks(params: dict[str, Any]) -> list[TaskSeed]:
             raise _fail(f"years must be integers (got {years_raw!r})") from None
         if from_year > to_year:
             raise _fail(f"years start {from_year} is after its end {to_year}")
+        # NOTE: no builtin list() here (or anywhere in this module after
+        # import time) — build_source's deferred import of the sibling
+        # module `list` binds `list` in this package namespace, shadowing
+        # the builtin (first seen 2026-09-19: the default-deild branch
+        # crashed with "'module' object is not callable"). DEILDS is
+        # already the tuple we iterate.
         deilds = (
             _parse_deilds(str(params["deild"]))
             if params.get("deild")
-            else list(DEILDS)
+            else DEILDS
         )
         seeds: list[TaskSeed] = []
         for year in range(from_year, to_year + 1):
@@ -322,6 +328,7 @@ def start_tasks(params: dict[str, Any]) -> list[TaskSeed]:
 
 def build_source() -> SourceDefinition:
     from adapters.isl.sources.stjornartidindi.advert import AdvertHandler
+    from adapters.isl.sources.stjornartidindi.clean import CLEAN_VERSION, IsCleanHandler
     from adapters.isl.sources.stjornartidindi.list import ListHandler
     from adapters.isl.sources.stjornartidindi.pdf import PdfHandler
 
@@ -332,6 +339,12 @@ def build_source() -> SourceDefinition:
             "stjornartidindi_list": ListHandler(),
             "stjornartidindi_advert": AdvertHandler(),
             "stjornartidindi_pdf": PdfHandler(),
+            "stjornartidindi_clean": IsCleanHandler(),
         },
+        clean=CleanDefinition(
+            task_type="stjornartidindi_clean",
+            version=CLEAN_VERSION,
+            targets=("stjornartidindi_advert",),
+        ),
         parallel_safe=True,  # key-free stateless API, no cookies (probed 2026-09-17)
     )

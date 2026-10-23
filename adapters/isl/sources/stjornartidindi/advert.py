@@ -188,10 +188,21 @@ class AdvertHandler:
 
         # Folder = gazette volume year (publicationNumber.year, the axis
         # reliable across retro-digitised items whose publicationDate is
-        # their system-entry date) + the zero-padded issue number.
+        # their system-entry date) + deild letter + zero-padded issue
+        # number (``2025/A0107-2025``, matching the source's own PDF
+        # naming ``A_nr_107_2025.pdf``). The deild letter is NOT
+        # decorative: issue numbers restart at 1 within each deild, so a
+        # bare ``0107-2025`` collides across deilds — first seen in the
+        # 2026-09-19 full backfill (2,522 shared folders / 5,480 docs /
+        # 2,959 overwritten files; repaired by a full re-fetch).
         number = str(pub_number.get("number") or "")
         year = str(pub_number.get("year") or "") or str(task.params.get("year", ""))
-        folder_stem = f"{int(number):04d}-{year}" if number.isdigit() and year else (pub_num.replace("/", "-") or advert_id)
+        deild_letter = deild[0].upper() if deild[:1].isalpha() else "X"
+        folder_stem = (
+            f"{deild_letter}{int(number):04d}-{year}"
+            if number.isdigit() and year
+            else f"{deild_letter}-{pub_num.replace('/', '-') or advert_id}"
+        )
         folder = f"01_raw/stjornartidindi/{year or pub_date[:4]}/{folder_stem}"
 
         source_url = site_url_for(advert_id)

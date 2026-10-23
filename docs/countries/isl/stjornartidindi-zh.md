@@ -16,7 +16,7 @@
 
 条目内部结构：每个公布事件一条记录，含发布机构（involvedParty，如 Utanríkisráðuneytið 外交部）、原生类型词（如 LÖG / REGLUGERÐ / GJALDSKRÁ）、公报编号（`{序号}/{卷年}`，如 107/2025）、签署日期、公布日期，正文以 HTML 内联并另有 PDF 版面原件（`https://adverts.stjornartidindi.is/{A|B|C}_nr_{序号}_{年}.pdf`）。
 
-**数字化覆盖边界**（2026-09-17 实测）：API 覆盖 **2001 年起全部条目**（2001 年 1,223 条；2024 年 2,064 条）；**1995–2000 年为选择性数字化**（每年 21–48 条，全部是 C deild 的 EEA 类公告，且 HTML 只含刊期存根、正文只在 PDF）；更早年代（1878 年起）只有扫描件（timarit.is 等历史文库），无机器通道。
+**数字化覆盖边界**（2026-09-17 实测）：API 覆盖 **2001 年起全部条目**（2001 年 1,223 条；2024 年 2,064 条）；**1995–2000 年为选择性数字化**（每年 21–48 条，全部是 C deild 的 EEA 类公告，且 HTML 只含刊期存根、正文只在 PDF，本框架未收录该时段）；更早年代（1878 年起）只有扫描件（timarit.is 等历史文库），无机器通道。**2001–2005 年（散见至 2010）大量条目同样是"存根 HTML + PDF 正文"形态**（4,677 条，抓取时自动追加 PDF 兜底）。另注：站内条目约三分之一是地方市政发布（13,745/39,713，2026-09-21 结算），默认按国家级口径采集。
 
 **关键日期语义**：`publicationDate` 字段对现代实时条目就是真实刊日（如 1011/2026 号 → 2026-09-16，与公报网站当日展示一致）；对回溯补录的历史条目则是**入系统日期**（如 1995 年第 43 号 → 2003-09-26 入库）。区分二者看 `createdDate`（入系统时刻）：补录条目的 createdDate 与 publicationDate 同为远晚于签署日的时刻。本源按公布事件原样记录这两个字段，口径见第 7 节。
 
@@ -43,23 +43,23 @@
 
 **零领域表**——公报型扁平源：一个公布事件 = documents 表一行，没有跨文档持久实体（修订引用如 "(6.) breytingu á reglugerð nr. 406/2010" 原样保留在标题里；修订关系建图属分析阶段）。
 
-**文件夹布局**（顶层 = 源名；一层卷年、一层刊号文件夹，一个公布事件一个文件夹）：
+**文件夹布局**（顶层 = 源名；一层卷年、一层刊号文件夹，一个公布事件一个文件夹；**刊号前带部门字母**——公报刊号每部门独立从 1 编，无字母前缀会跨部门撞名）：
 
 ```
 {数据根}/ISL_policy/
 └── 01_raw/stjornartidindi/
     └── 2025/                          ← 公报卷年（publicationNumber.year）
-        ├── 0107-2025/                 ← 刊号（零补位），本例 107/2025 号法律
+        ├── A0107-2025/                ← 部门字母 + 刊号（零补位），本例 A deild 107/2025 号法律
         │   ├── doc.html               ← 正文（主文件，file_hash 对应它）
         │   ├── meta.json              ← 详情 API 响应原样存档
-        │   └── doc.pdf                ← 仅存根条目才有（1995–2000 代）
-        └── 0108-2025/
+        │   └── doc.pdf                ← 仅存根条目才有（2001–2005 年代）
+        └── B0001-2025/
             └── …
 ```
 
 **documents 表承担**：全部书目字段（标题、公布日、发布机构、类型、语言 `isl`）+ 国家特色字段进 `meta`（签署日、入系统时间、部门、刊号、状态、类别、各 URL 等，见第 7 节）。`local_path` 指向 `doc.html`；`meta.json` / `doc.pdf` 的路径记在 `meta.files`。
 
-**真实案例走查**（107/2025 号，2026-09-17 实测）：A deild 法律《LÖG um breytingu á lögum um úrvinnslugjald, nr. 162/2002…》（回收处理费法修正案），发布机构 Umhverfis-, orku- og loftslagsráðuneytið（环境、能源与气候部）；签署 2025-12-24，公布 2025-12-29；正文 HTML 约 214 万字符（颁布令 + 逐条修正文本），PDF 直链 `A_nr_107_2025.pdf`。抓取后：documents 一行（publication_date=2025-12-29，doc_type=STATUTE），文件夹 `01_raw/stjornartidindi/2025/0107-2025/` 内 doc.html + meta.json 两个文件。
+**真实案例走查**（107/2025 号，2026-09-17 实测）：A deild 法律《LÖG um breytingu á lögum um úrvinnslugjald, nr. 162/2002…》（回收处理费法修正案），发布机构 Umhverfis-, orku- og loftslagsráðuneytið（环境、能源与气候部）；签署 2025-12-24，公布 2025-12-29；正文 HTML 约 214 万字符（颁布令 + 逐条修正文本），PDF 直链 `A_nr_107_2025.pdf`。抓取后：documents 一行（publication_date=2025-12-29，doc_type=STATUTE），文件夹 `01_raw/stjornartidindi/2025/A0107-2025/` 内 doc.html + meta.json 两个文件。
 
 ## 5. 完整案例走查
 
@@ -67,9 +67,9 @@
 
 1. **发现**：日轴列表任务 `stjornartidindi_list(axis=pubdate, date=2026-05-29)` 命中 `GET /api/v1/adverts-lean?dateFrom=2026-05-29&dateTo=2026-05-29&sortBy=publicationDate&direction=ASC`，返回该日全部条目的轻量行；本条行内字段：`publicationNumber.full=550/2026`、`involvedParty.title=Kópavogsbær`、`department.slug=b-deild`、`publicationDate=2026-05-29T…`。
 2. **scope 过滤**：Kópavogsbær（市镇名）命中市政过滤 → scope=state（默认）下该行被过滤，**不生成种子**；同日国家级条目照常派发。过滤计数在任务结果里说明。
-3. **条目抓取**（以国家级条目 548/2026 为例，Húsnæðis-, mannvirkja- og skipulagsstofnun 住房建设规划局的规划公告，2026-05-26 刊）：`stjornartidindi_advert` 任务 `GET /api/v1/adverts/{uuid}`，响应含元数据与内联 HTML → documents 入账、两个文件落盘（`01_raw/stjornartidindi/2026/0548-2026/doc.html` + `meta.json`）。
+3. **条目抓取**（以国家级条目 548/2026 为例，Húsnæðis-, mannvirkja- og skipulagsstofnun 住房建设规划局的规划公告，2026-05-26 刊）：`stjornartidindi_advert` 任务 `GET /api/v1/adverts/{uuid}`，响应含元数据与内联 HTML → documents 入账、两个文件落盘（`01_raw/stjornartidindi/2026/B0548-2026/doc.html` + `meta.json`）。
 4. **游标**：当日最后一个分页任务完成时 `stjornartidindi_last_date` 推进到 2026-05-29；下次 `sync=1` 从 2026-05-30 开始。
-5. **复查**：账本可查——`SELECT title, publication_date, issuing_authority, doc_type FROM documents WHERE doc_id LIKE 'ISL_20260526%'`；磁盘可查——`01_raw/stjornartidindi/2026/0548-2026/doc.html`。
+5. **复查**：账本可查——`SELECT title, publication_date, issuing_authority, doc_type FROM documents WHERE doc_id LIKE 'ISL_20260526%'`；磁盘可查——`01_raw/stjornartidindi/2026/B0548-2026/doc.html`。
 
 ## 6. 怎么跑
 
@@ -111,7 +111,25 @@ python cli.py requeue --country isl --task-id {task_id}
 - **生效日**：API 无结构化生效日字段，缺失如实记录（正文内可读，属清洗阶段工作）。
 - **附件与更正**（`attachments` / `corrections` 字段）：探查样本中均为空数组；非空时原样 JSON 串入 meta，未建结构。
 
-## 9. 端点速查表
+## 9. 清理（正文纯文本提取）
+
+每份文档对应 `02_cleaned/` 下一个 .txt 纯文本（只留正文，装饰已剥除），随账本可查（字数、位置）。两种载体两条处理路线，按文件开头的格式标记自动分流：
+
+- **网页载体（2006 年起为主，约 2.1 万份）**：文件本身就是纯正文，只删文末"某部 - 出版日期"戳行（日期各不相同，用居中容器匹配删除，不会误伤正文里提到"útgáfud"一词的段落）。
+- **PDF 载体（2001–2005 年代约 4,700 份，正文在 PDF）**：版面解析提取，并删印刷版头三件套（报名、期号、日期戳）；每页平均文字量低于 150 字符的是扫描图片做的年度合订本（4 份：380/2001、847/2001、158/2001、158/2002），明确标"提取不了"（要内容需 OCR 文字识别，未做）。
+- 一份特例：44/2004 无正文文件（当时抓到的"PDF"实为 Word 文件被拒），清理时明确记失败。
+
+账本里"正文文件"指针曾指着占位网页（4,676 份），已一次性改指 PDF（每条留审计记录，命令 `repair-isl-mainfile`，可重复执行无副作用）。
+
+命令（本地读文件、不联网）：
+
+```bash
+python cli.py clean --country isl --dry-run   # 只看播种计划
+python cli.py clean --country isl             # 全量清理（断点续跑；幂等，重跑零改写）
+python cli.py status --country isl --source stjornartidindi
+```
+
+## 10. 端点速查表
 
 **在用**：
 
@@ -136,4 +154,4 @@ python cli.py requeue --country isl --task-id {task_id}
 
 ---
 
-*更新日期：2026-09-19；数据快照：2026-09-17（探查）/ 2026-09-19（试跑）；数据由 2026-09-19 试跑窗口背书——公布日轴 2026-05-25..29（57 条源站条目，48 条国家级入账，多重集逐一相同）+ 卷年轴 2025 年 A deild（109 部法律，刊号 1..109 连续，多重集逐一相同）；157 文档三方一致，幂等重跑零请求。*
+*更新日期：2026-09-30；数据快照：2026-09-21（全量采集）/ 2026-09-30（全量清理）；采集由 2001–2026 全量回填背书（25,977 文档，78 切片多重集对账零缺失，全量 sha256 一致，磁盘 0.80 GB）；清理由 2026-09-30 全量提取背书（25,972 份纯文本 / 158 MB，4 份扫描类合订本 + 1 份无正文件明确记失败，14 份抽样眼检，重跑零改写）。*
