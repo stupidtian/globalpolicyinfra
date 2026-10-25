@@ -61,7 +61,13 @@ class DouCleanHandler:
 
     def parse(self, response: Response, task: TaskView) -> TaskResult:
         doc_id = str(task.params["doc_id"])
-        content = response.content
+        # A handful of source pages embed UTF-8 BOM sequences inside the
+        # markup (probed 2026-10-20: one 2022 page carries 11, one lands as
+        # the first character of the rendered text). U+FEFF is a byte-order
+        # signature, never Portuguese content — strip it before rendering so
+        # the output meets the engine's determinism contract (run 1: the
+        # unstripped BOM was correctly refused as a contract violation).
+        content = response.content.replace(b"\xef\xbb\xbf", b"")
         if not content.strip():
             raise PermanentError(f"clean {doc_id}: stored file is empty")
         try:
