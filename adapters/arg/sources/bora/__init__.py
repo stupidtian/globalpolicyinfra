@@ -142,26 +142,42 @@ def resolve_rubros(raw: Any) -> str:
     return ",".join(sorted(names))
 
 
-def cursor_key(rubros_param: str) -> str:
-    """Watermark key per scope: each scope keeps its own cursor, so widening
-    starts a fresh chain while the narrower scope's watermark stands (the
-    identity layer dedups the overlap — 多入口一漏斗). The unfiltered scope
-    keeps the plain historical key."""
-    if rubros_param == "all":
+def cursor_key(rubros_param: str, anexos_param: str = "on") -> str:
+    """Watermark key per collection policy (rubros scope × attachment
+    setting): each policy keeps its own cursor, so widening or re-enabling
+    attachments starts a fresh chain while the narrower policy's watermark
+    stands (the identity layer dedups the overlap — 多入口一漏斗). The
+    delivered-v1 policy (all rubros, attachments on) keeps the plain
+    historical key."""
+    if rubros_param == "all" and anexos_param == "on":
         return CURSOR_KEY
-    if rubros_param == ",".join(sorted(NORMAS_RUBROS)):
-        return f"{CURSOR_KEY}[normas]"
-    digest = hashlib.md5(rubros_param.encode()).hexdigest()[:6]
+    normas = ",".join(sorted(NORMAS_RUBROS))
+    if rubros_param == normas:
+        if anexos_param == "on":
+            return f"{CURSOR_KEY}[normas]"  # 2026-10-08 smoke-run key
+        return f"{CURSOR_KEY}[normas-html]"
+    digest = hashlib.md5(f"{rubros_param}|{anexos_param}".encode()).hexdigest()[:6]
     return f"{CURSOR_KEY}[{digest}]"
+
+
+def resolve_anexos(raw: Any) -> str:
+    """CLI ``anexos`` value → "on" | "off" (default off, user ruling
+    2026-10-08: HTML text only for the backfill; attachment URLs stay in
+    meta so flipping to ``anexos=on`` later re-parses each detail page under
+    a new task identity and fetches the PDFs — no re-planning needed)."""
+    value = str(raw if raw is not None else "off").strip().lower()
+    if value not in ("on", "off"):
+        raise _fail(f"anexos must be on | off (got {raw!r})")
+    return value
 
 
 def _fail(message: str) -> SystemExit:
     return SystemExit(
         f"error: {message}\n"
         "usage examples:\n"
-        "  python cli.py collect --country arg --source bora window=2026-08-28:2026-08-31\n"
+        "  python cli.py collect --country arg --source bora window=2013-01-01:2013-12-31\n"
         "  python cli.py collect --country arg --source bora sync=1\n"
-        "  python cli.py collect --country arg --source bora window=2026-01-01:2026-12-31 rubros=all\n"
+        "  python cli.py collect --country arg --source bora window=2026-01-01:2026-12-31 rubros=all anexos=on\n"
         "  python cli.py status --country arg --source bora"
     )
 
@@ -176,7 +192,8 @@ def _parse_date(raw: str, label: str) -> date:
 def start_tasks(params: dict[str, Any]) -> list[TaskSeed]:
     is_sync = str(params.get("sync", "")).strip() in ("1", "true", "yes")
     rubros = resolve_rubros(params.get("rubros", "normas"))
-    key = cursor_key(rubros)
+    anexos = resolve_anexos(params.get("anexos", "off"))
+    key = cursor_key(rubros, anexos)
 
     if params.get("window"):
         window = str(params["window"])
@@ -222,6 +239,7 @@ def start_tasks(params: dict[str, Any]) -> list[TaskSeed]:
                 "to": to_date.isoformat(),
                 "run": run,
                 "rubros": rubros,
+                "anexos": anexos,
             },
         )
     ]

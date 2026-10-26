@@ -58,5 +58,6 @@ class BoraFechaHandler:
             "to": to,
             "run": str(task.params["run"]),
             "rubros": str(task.params.get("rubros", "all")),
+            "anexos": str(task.params.get("anexos", "on")),
         }
         return TaskResult(next_tasks=[TaskSeed(type="bora_seccion", params=params)])

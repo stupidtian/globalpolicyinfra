@@ -137,6 +137,10 @@ class BoraDetalleHandler:
         anexo_calls = _ANEXO_RE.findall(page)
         anexo_files = [f"anexo_{nro}.pdf" for _, nro, _, _ in anexo_calls]
         pub_ymd = _pub_ymd(publication_date)
+        fetch_anexos = str(task.params.get("anexos", "on")) == "on"
+        # anexos=off (user ruling 2026-10-08): register the ids in meta but
+        # spawn no downloads — flipping to anexos=on later re-runs this task
+        # under a new identity and fetches them; no data is lost either way.
         anexo_seeds = [
             TaskSeed(
                 type="bora_anexo",
@@ -150,7 +154,7 @@ class BoraDetalleHandler:
                 },
             )
             for sec, nro, aid, fpub in anexo_calls
-        ]
+        ] if fetch_anexos else []
 
         meta: dict[str, str] = {"aviso_id": aviso_id, "seccion": seccion}
         if rubro:
@@ -244,7 +248,7 @@ class BoraDetalleHandler:
 
             main_name = "aviso.pdf"
 
-        meta["files"] = ";".join([main_name, *anexo_files])
+        meta["files"] = ";".join([main_name, *anexo_files] if fetch_anexos else [main_name])
         # Canonical identity keys off the *page's own* publication date, not
         # the listing day it was discovered through: the same aviso can sit in
         # several days' listings (observed 2026-09-03: avisos 346758/346760 in

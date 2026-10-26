@@ -66,7 +66,7 @@ _SECTION_MARKER = "avisosSeccionDiv"
 _HOME_MARKER = "diasHabilitadosPortadaSuplemento"
 
 
-def parse_listing(html: str, expected_date: str) -> list[dict[str, str]]:
+def parse_listing(html: str, expected_date: str, initial_rubro: str = "") -> list[dict[str, str]]:
     """Walk the listing rows in document order, tracking the current rubro.
 
     Works for both the full page-1 HTML and the pagination fragments (same
@@ -77,7 +77,11 @@ def parse_listing(html: str, expected_date: str) -> list[dict[str, str]]:
     headers = [(m.start(), m.group("rubro")) for m in _HEADER_RE.finditer(html)]
     items: list[dict[str, str]] = []
     seen: set[str] = set()
-    rubro = ""
+    # A continuation fragment opens mid-rubro: the rows leading it belong to
+    # the rubro the PREVIOUS page ended on — which is exactly the ult_rubro
+    # we sent as the continuation key (2013-pilot finding: 70 of 5,832 docs
+    # lost their rubro to this before the fix).
+    rubro = initial_rubro
     header_idx = -1
     for m in _ROW_RE.finditer(html):
         # both iterators walk in document order: advance the header pointer
@@ -133,11 +137,12 @@ def parse_listing(html: str, expected_date: str) -> list[dict[str, str]]:
     return items
 
 
-def _detalle_params(item: dict[str, str]) -> dict[str, str]:
+def _detalle_params(item: dict[str, str], anexos_param: str = "on") -> dict[str, str]:
     params = {
         "seccion": item["seccion"],
         "aviso_id": item["aviso_id"],
         "fecha": item["fecha"],
+        "anexos": anexos_param,
     }
     if item["rubro"]:
         params["rubro"] = item["rubro"]
@@ -161,6 +166,7 @@ def _next_day_params(task: TaskView) -> TaskSeed | None:
             "to": str(task.params["to"]),
             "run": str(task.params["run"]),
             "rubros": str(task.params.get("rubros", "all")),
+            "anexos": str(task.params.get("anexos", "on")),
         },
     )
 
@@ -191,7 +197,8 @@ class BoraSeccionHandler:
         date_iso = str(task.params["date"])
         pag = int(task.params.get("pag", 1))
         rubros_param = str(task.params.get("rubros", "all"))
-        key = cursor_key(rubros_param)
+        anexos_param = str(task.params.get("anexos", "on"))
+        key = cursor_key(rubros_param, anexos_param)
         next_day = _next_day_params(task)
 
         if pag == 1:
@@ -214,8 +221,24 @@ class BoraSeccionHandler:
                 )
             selected = _FECHA_SEL_RE.findall(page)
             if selected and selected[0] != date_iso.replace("-", ""):
+                serves = selected[0]
+                if serves > date_iso.replace("-", ""):
+                    # Stale orphan from a superseded run (first seen in the
+                    # 2013 pilot, 2026-10-20): a paused chain's tasks linger
+                    # with the old run stamp while the resumed run's twin —
+                    # same day, new stamp — collects the day and moves the
+                    # session forward. The session only advances day by day
+                    # through completed chains, so a *later* served date
+                    # proves this day was already collected: a benign skip.
+                    return TaskResult(
+                        expected_empty=(
+                            f"seccion {date_iso}: stale duplicate of a superseded "
+                            f"run (session now serves {serves}); this day was "
+                            "collected under the current run's chain"
+                        )
+                    )
                 raise TransientError(
-                    f"seccion {date_iso}: session serves {selected[0]} — the "
+                    f"seccion {date_iso}: session serves {serves} — the "
                     "date-selection task for this day has not run (stale "
                     "chain or ordering); retrying after it re-establishes"
                 )
@@ -229,7 +252,8 @@ class BoraSeccionHandler:
             more = bool(payload.get("hay_mas_datos"))
             ult_rubro = str(payload.get("ult_rubro") or "")
 
-        raw_items = parse_listing(html, date_iso)
+        initial = str(task.params.get("ult_rubro", "")) if pag > 1 else ""
+        raw_items = parse_listing(html, date_iso, initial_rubro=initial)
         items = raw_items
         if rubros_param != "all":
             # Enumeration-layer scope filter (user ruling 2026-10-08): the
@@ -243,7 +267,8 @@ class BoraSeccionHandler:
                 if not item["rubro"] or normalize_rubro(item["rubro"]) in scope
             ]
         seeds = [
-            TaskSeed(type="bora_detalle", params=_detalle_params(item)) for item in items
+            TaskSeed(type="bora_detalle", params=_detalle_params(item, anexos_param))
+            for item in items
         ]
         if more:
             params: dict[str, str] = {
@@ -251,6 +276,7 @@ class BoraSeccionHandler:
                 "to": str(task.params["to"]),
                 "run": str(task.params["run"]),
                 "rubros": rubros_param,
+                "anexos": anexos_param,
                 "pag": str(pag + 1),
             }
             if ult_rubro:
