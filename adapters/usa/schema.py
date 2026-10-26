@@ -54,6 +54,7 @@ __all__ = [
     "bill_identity",
     "fr_doc_type",
     "fr_folder",
+    "normalize_fr_document_number",
     "president_name",
     "yn_flag",
 ]
@@ -266,6 +267,21 @@ def bill_folder(congress: int, bill_type: str, number: str | int) -> str:
     (``01_raw/bills/``), per the 2026-09-01 layout spec."""
     _, type_upper, number_str = bill_identity(congress, bill_type, number)
     return f"01_raw/bills/{int(congress)}/{type_upper.upper()}{number_str}"
+
+
+def normalize_fr_document_number(document_number: str) -> str:
+    """Collapse the FR document number's variable zero padding so scraped
+    filenames and ledger ids collide: ``00-02053`` / ``00-2053`` / ``00-205``
+    all normalize to ``00-205``; correction prefixes (``C1-2026-15326``) and
+    anything non-numeric pass through unchanged."""
+    doc_id = document_number.strip()
+    if "-" not in doc_id:
+        return doc_id
+    head, _, seq = doc_id.rpartition("-")
+    try:
+        return f"{head}-{int(seq)}"
+    except ValueError:
+        return doc_id
 
 
 def fr_folder(publication_date: str, document_number: str) -> str:

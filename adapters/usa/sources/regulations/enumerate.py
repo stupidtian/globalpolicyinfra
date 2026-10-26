@@ -13,15 +13,40 @@ already-fetched detail is simply never re-enqueued.
 
 from __future__ import annotations
 
+from datetime import UTC, date, datetime, timedelta
 from typing import Any
 
 from adapters.base import RequestSpec, Response, TaskResult, TaskSeed, TaskView
 from adapters.usa.schema import fr_folder, president_name
 
-__all__ = ["API_BASE", "LISTING_FIELDS", "PAGE_SIZE", "FrListPageHandler"]
+__all__ = ["API_BASE", "LISTING_FIELDS", "PAGE_SIZE", "TYPE_CODES", "FrListPageHandler"]
 
 API_BASE = "https://www.federalregister.gov/api/v1"
 PAGE_SIZE = 1000
+
+#: The API silently caps any query at 10,000 results: total_pages tops out
+#: at PAGE_SIZE-strided 10 no matter how many documents actually match.
+_API_CAP_PAGES = 10000 // PAGE_SIZE
+
+#: Bisection floor: a window shorter than this cannot plausibly hit the cap
+#: (~1% of a cap even for the heaviest rule years), so stop splitting there.
+_BISECT_FLOOR_DAYS = 31
+
+#: A fully swept window advances the sync cursor only when its end is at
+#: the present edge (within this many days of today). Capped-window
+#: bisection finishes sub-windows out of order; an old-ending window
+#: stamping would move the watermark backwards on a coin flip.
+_CURSOR_GRACE_DAYS = 7
+
+#: Friendly type tokens -> the API's internal uppercase codes. The filter
+#: takes the codes (``conditions[type][]=RULE``); the pretty names the JSON
+#: returns ("Rule", "Proposed Rule") are NOT accepted by the filter.
+TYPE_CODES: dict[str, str] = {
+    "rule": "RULE",
+    "proposed": "PRORULE",
+    "notice": "NOTICE",
+    "presidential": "PRESDOCU",
+}
 
 #: Ask for the rich field set so listing rows are near-complete on their own
 #: (the detail endpoint adds subtype/dates/corrections/topics and friends).
@@ -65,6 +90,14 @@ class FrListPageHandler:
             "page": int(task.params.get("page", 1)),
             "fields[]": list(LISTING_FIELDS),
         }
+        # optional type filter, e.g. types=rule,proposed -> RULE+PRORULE only
+        # (the lifecycle backfill skips NOTICE/PRESDOCU: ~83% of modern years)
+        type_tokens = task.params.get("types") or []
+        if type_tokens:
+            params["conditions[type][]"] = [
+                TYPE_CODES.get(str(t).strip().lower(), str(t).strip().upper())
+                for t in type_tokens
+            ]
         return RequestSpec(url=f"{API_BASE}/documents.json", params=params)
 
     def parse(self, response: Response, task: TaskView) -> TaskResult:
@@ -123,6 +156,30 @@ class FrListPageHandler:
         page = int(params.get("page", 1))
         total_pages = int(payload.get("total_pages") or 0)
         max_pages = params.get("max_pages")
+
+        # A capped "fully swept" window is a lie — it both loses rows and
+        # would forge the cursor. Split the window in half and sweep the
+        # halves (page-1 rows still count); recursion bottoms out at
+        # windows that genuinely fit under the cap.
+        window_from = str(params["from"])[:10]
+        window_to = str(params["to"])[:10]
+        span = (date.fromisoformat(window_to) - date.fromisoformat(window_from)).days
+        if page == 1 and total_pages >= _API_CAP_PAGES and span > _BISECT_FLOOR_DAYS:
+            mid = date.fromisoformat(window_from) + timedelta(days=span // 2)
+            halves = [
+                {**params, "from": window_from, "to": mid.isoformat(), "page": 1},
+                {
+                    **params,
+                    "from": (mid + timedelta(days=1)).isoformat(),
+                    "to": window_to,
+                    "page": 1,
+                },
+            ]
+            return TaskResult(
+                upsert_rows={"fr_documents": rows},
+                next_tasks=[TaskSeed(type="fr_list_page", params=half) for half in halves],
+            )
+
         more_pages = page < total_pages
         if more_pages and (max_pages is None or page < int(max_pages)):
             chain_params = dict(params)
@@ -130,10 +187,13 @@ class FrListPageHandler:
             next_tasks.append(TaskSeed(type="fr_list_page", params=chain_params))
 
         result = TaskResult(upsert_rows={"fr_documents": rows}, next_tasks=next_tasks)
-        # FR is date-partitioned: any fully swept window justifies advancing
-        # the cursor to its end (unlike congress-enumerated bills). A later
-        # backfill into an earlier window may move it back — harmless, the
-        # next sync re-sweeps idempotently.
+        # FR is date-partitioned, so a complete sweep of a window at the
+        # present edge advances the sync cursor to its end. Windows that
+        # end in history (bisected backfill segments) never stamp — with
+        # many sub-windows finishing out of order, an old end would move
+        # the watermark backwards at random.
         if not more_pages:
-            result.cursor_updates = {"fr_last_pub_date": str(params["to"])}
+            today = datetime.now(UTC).date()
+            if (today - date.fromisoformat(window_to)).days <= _CURSOR_GRACE_DAYS:
+                result.cursor_updates = {"fr_last_pub_date": window_to}
         return result

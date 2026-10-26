@@ -79,6 +79,10 @@ Command-line parameters (key=value form):
 
 ```
 window=FROM:TO          FR chain: documents published in the range (e.g. 2026-08-17:2026-08-19)
+types=rule,proposed     FR chain: only these types (tokens rule/proposed/notice/presidential map to
+                        the API's internal codes RULE/PRORULE/…; default = all types). Notices are
+                        ~83% of modern years — use rule,proposed to cut volume to ~1/6 when
+                        rebuilding regulation lifecycles
 deep=none|all           FR chain: whether listing also fetches detail+text (default none = register only)
 formats=txt,xml         text formats to download (default txt,xml; pdf not fetched)
 max_pages=N             cap the listing chain at N pages (test guardrail)
@@ -86,6 +90,18 @@ cases=DOCNUM[,…]        documents to deep-crawl regardless of the window
 agenda=all|edition list agenda chain: e.g. all or 202510,202504 (not started by default)
 oira=all|year list      review chain: e.g. all or 2025,2024; all includes the rolling files
 sync=1                  FR incremental: window starts at the kv cursor fr_last_pub_date and ends today
+```
+
+Full-history backfill (rules only — for lifecycle reconstruction; 1994 API coverage is partial, complete from 1995):
+
+```bash
+python cli.py collect --country usa --source regulations window=1994-01-01:2026-12-31 types=rule,proposed
+```
+
+Fill text gaps (leftovers after adopting an external scrape, plus routine new publications; txt by default):
+
+```bash
+python cli.py fill-fr-text --country usa
 ```
 
 One key difference from bills: **an FR document barely changes once published** (mistakes become separate correction documents linked to the original), so the FR side needs no reopen-on-signal mechanism — incrementals simply chase "publication date > last cursor".
@@ -207,4 +223,4 @@ python cli.py requeue --country usa
 
 ---
 
-*Last updated: 2026-09-01 (layout paths migrated; content unchanged since 2026-08-27)*
+*Last updated: 2026-10-24 (full-history rules backfill: 197,606 Rule/Proposed docs since 1994-01-03, 105,573 carrying RINs, 32,281 unique RINs; ledger now fr_documents 197,774 — of the rules, 197,005/197,006 (99.999%) carry full text: 183,647 files / 8.68 GB adopted 2026-10-23 from a prior GPO scrape, plus 13,320 fetched 2026-10-24 via fill-fr-text; the single gap (00-6228) has no txt rendition at the source (404), its metadata and html rendition are intact; all 8,695 three-chain RINs have full text — see fr-text-import.md)*

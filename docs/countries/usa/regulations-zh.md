@@ -78,6 +78,9 @@
 
 ```
 window=FROM:TO          FR 链：发布日期在区间内的文档（如 2026-08-17:2026-08-19）
+types=rule,proposed     FR 链：只取这些类型（令牌 rule/proposed/notice/presidential，映射 API 内部代码
+                        RULE/PRORULE/…；缺省=全类型）。通知类约占现代年份的 83%，重建规制
+                        生命周期时用 rule,proposed 过滤即可把量压到约 1/6
 deep=none|all           FR 链：清单时是否顺带抓详情+正文（默认 none 只登记）
 formats=txt,xml         正文格式（默认 txt,xml；pdf 不抓）
 max_pages=N             清单链只翻 N 页（测试护栏）
@@ -85,6 +88,18 @@ cases=文档号[,..]       指定深抓的文档（无论窗口）
 agenda=all|期次列表      议程链：如 all 或 202510,202504（默认不启动）
 oira=all|年份列表        审查链：如 all 或 2025,2024；all 含当日在审文件
 sync=1                  FR 增量：窗口起点用 kv 游标 fr_last_pub_date，终点=今天
+```
+
+全历史回填（只取规则类，重建生命周期用；1994 年 API 覆盖残缺，1995 起完整）：
+
+```bash
+python cli.py collect --country usa --source regulations window=1994-01-01:2026-12-31 types=rule,proposed
+```
+
+补齐缺失正文（认领外部抓取后的余量、日常新增，只抓 txt 默认）：
+
+```bash
+python cli.py fill-fr-text --country usa
 ```
 
 FR 与 bills 的一个关键差异：**FR 文档一经发布基本不变**（有错会另发一份纠错文档互相链接），所以 FR 侧不需要"更新信号重开"机制，增量就是"发布日期 > 上次游标"往下追。
@@ -206,4 +221,4 @@ python cli.py requeue --country usa
 
 ---
 
-*更新日期：2026-09-01（目录路径迁移 regulations/，内容未动；上次规范翻新 2026-08-30）；数据快照：2026-08-27；数据由规制全生命周期三链实跑背书（1,233 任务全 done：rulemakings 46,562 / ua_entries 241,726 / oira_reviews 44,586 / FR 出版 739+498）。*
+*更新日期：2026-10-24（FR 全历史规则类回填：197,606 份 Rule/Proposed〔1994-01-03 起〕，带 RIN 105,573 份、唯一 RIN 32,281 个；此前 2026-09-01 目录迁移、2026-08-27 三链样本实跑）；数据快照：2026-10-23；三链台账——rulemakings 46,562 / ua_entries 241,726 / oira_reviews 44,586 / fr_documents 197,774、其中规则类 197,005/197,006（99.999%）有正文全文〔2026-10-23 认领用户既有 GPO 抓取 183,647 份 +8.68 GB；2026-10-24 fill-fr-text 官方渠道补齐 13,320 份；唯一缺口 00-6228 的 txt 版源头即无（404），元数据与 html 版完好〕；三链齐全 8,695 个 RIN 全部有全文。见 fr-text-import.md。*

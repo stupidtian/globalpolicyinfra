@@ -206,6 +206,38 @@ def build_parser() -> argparse.ArgumentParser:
         help="Explicit config file location (default: ~/.globalpolicyinfra/config.toml).",
     )
 
+    import_parser = subparsers.add_parser(
+        "import-fr-text",
+        help="One-time adoption of a prior FR text scrape (fr-text-import.md).",
+    )
+    import_parser.add_argument("--country", required=True, help="ISO3 code, e.g. usa")
+    import_parser.add_argument(
+        "--source-dir", required=True,
+        help="Directory of scraped {docnum}.txt files (copied, never moved)",
+    )
+    import_parser.add_argument(
+        "--apply", action="store_true",
+        help="Execute the adoption (default: dry run)",
+    )
+    import_parser.add_argument(
+        "--config-file", default=None,
+        help="Explicit config file location (default: ~/.globalpolicyinfra/config.toml).",
+    )
+
+    fill_parser = subparsers.add_parser(
+        "fill-fr-text",
+        help="Backfill full text for FR rules with no file on record (fr_detail chain).",
+    )
+    fill_parser.add_argument("--country", required=True, help="ISO3 code, e.g. usa")
+    fill_parser.add_argument(
+        "--formats", default="txt",
+        help="Text formats to fetch (default txt; e.g. txt,xml)",
+    )
+    fill_parser.add_argument(
+        "--config-file", default=None,
+        help="Explicit config file location (default: ~/.globalpolicyinfra/config.toml).",
+    )
+
     dnk_mainfile_parser = subparsers.add_parser(
         "repair-dnk-mainfile",
         help="One-time DNK repair: point documents.local_path at the full-text "
@@ -682,6 +714,163 @@ def _run_repair_documents(args: argparse.Namespace) -> int:
     return 0 if touched else 1
 
 
+# -- import-fr-text (one-time adoption of a prior GPO scrape) -------------------------
+#
+# DEVIATION (recorded in docs/tasks/2026-08-24-usa/fr-text-import.md): bulk
+# file adoption bypasses write_batch with direct batched INSERTs in one
+# transaction per batch, mirroring migrate-layout. Idempotent: rows already
+# registered with a local_path are skipped; re-running re-copies only what
+# was never registered (same source bytes, harmless overwrite).
+
+
+def _run_import_fr_text(args: argparse.Namespace) -> int:
+    import hashlib
+    import json as _json
+
+    from adapters.usa.schema import fr_doc_type, normalize_fr_document_number
+    from core.document import compute_doc_id
+
+    try:
+        data_root = resolve_data_root(config_path=args.config_file)
+    except ConfigError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    country = args.country.upper()
+    source_dir = Path(args.source_dir)
+    if not source_dir.is_dir():
+        print(f"error: {source_dir} is not a directory", file=sys.stderr)
+        return 1
+    country_root = paths.country_dir(data_root, country)
+
+    # scan the scrape: normalized doc number -> original filename
+    scraped: dict[str, str] = {}
+    total_files = 0
+    for entry in source_dir.iterdir():
+        if not entry.name.endswith(".txt"):
+            continue
+        total_files += 1
+        key = normalize_fr_document_number(entry.name[:-4])
+        scraped.setdefault(key, entry.name)
+    print(f"[{country}] scanned {total_files:,} files "
+          f"({total_files - len(scraped):,} zero-padding collisions folded)")
+
+    with StateStore.for_country(data_root, country) as store:
+        conn = store.connection
+        registered = {
+            r["entity_ref"]
+            for r in conn.execute(
+                "SELECT entity_ref FROM documents "
+                "WHERE entity_ref LIKE 'fr_documents:%' AND local_path IS NOT NULL"
+            )
+        }
+        rows = conn.execute(
+            "SELECT document_number, publication_date, title, type, subtype, "
+            "executive_order_number, agencies, folder FROM fr_documents"
+        ).fetchall()
+
+        plan = []
+        for row in rows:
+            entity_ref = f"fr_documents:{row['document_number']}"
+            if entity_ref in registered:
+                continue
+            name = scraped.get(normalize_fr_document_number(row["document_number"]))
+            if name:
+                plan.append((row, name, entity_ref))
+        print(f"[{country}] claimable: {len(plan):,} "
+              f"(skipped: {len(registered):,} already registered)")
+        if not plan:
+            print("nothing to do")
+            return 0
+        if not args.apply:
+            print("dry run — pass --apply to execute")
+            return 0
+
+        from datetime import UTC as _UTC
+        from datetime import datetime as _dt
+        now = _dt.now(_UTC).isoformat().replace("+00:00", "Z")
+        insert_sql = (
+            "INSERT OR IGNORE INTO documents "
+            "(doc_id, country_code, title, publication_date, issuing_authority, "
+            "doc_type, source_url, entity_ref, produced_by, language, meta, "
+            "registered_at, raw_format, local_path, file_hash, content_length, "
+            "collection_date) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
+        )
+        done = 0
+        for batch_start in range(0, len(plan), 5000):
+            batch = plan[batch_start : batch_start + 5000]
+            payloads = []
+            for row, name, entity_ref in batch:
+                src = source_dir / name
+                data = src.read_bytes()
+                dst = country_root / row["folder"] / "text" / name
+                dst.parent.mkdir(parents=True, exist_ok=True)
+                dst.write_bytes(data)
+                agencies = _json.loads(row["agencies"] or "[]")
+                lead = next(
+                    (a.get("raw_name") for a in agencies if a.get("raw_name")), None
+                )
+                meta = _json.dumps(
+                    {"adopted_from": str(src), "origin": "prior GPO scrape",
+                     "matched_by": "document_number"},
+                    ensure_ascii=False, sort_keys=True,
+                )
+                payloads.append((
+                    compute_doc_id(country, str(src), row["publication_date"]),
+                    country, row["title"] or row["document_number"],
+                    row["publication_date"], lead or "Federal Register",
+                    fr_doc_type(row["type"], row["subtype"], row["executive_order_number"]),
+                    str(src), entity_ref, "fr_text_adopt", "en", meta, now,
+                    "html" if data[:1] == b"<" else "txt",
+                    str(dst.relative_to(country_root)).replace("\\", "/"),
+                    hashlib.sha256(data).hexdigest(), len(data), now,
+                ))
+            with store.transaction() as tx:
+                tx.executemany(insert_sql, payloads)
+            done += len(batch)
+            print(f"  adopted {done:,}/{len(plan):,}")
+        with store.transaction() as tx:
+            tx.execute(
+                "INSERT INTO events (ts, entity_type, subject_id, stage, from_status, "
+                "to_status, detail) VALUES (?, 'documents', 'fr_text_adopt', NULL, NULL, "
+                "'applied', ?)",
+                (now, f"adopted {done} FR texts from prior GPO scrape"),
+            )
+    print(f"[{country}] import complete: {done:,} files adopted")
+    return 0
+
+
+def _run_fill_fr_text(args: argparse.Namespace) -> int:
+    from adapters.usa.sources.regulations import fill_missing_text_seeds
+
+    try:
+        data_root = resolve_data_root(config_path=args.config_file)
+    except ConfigError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    country = args.country.upper()
+    try:
+        source = get_source(country, "regulations")
+    except RegistryError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    paths.ensure_layout(data_root, country)
+    with StateStore.for_country(
+        data_root, country, domain_schema=source.domain_schema,
+        domain_keys=source.domain_keys,
+    ) as store:
+        seeds = fill_missing_text_seeds(store, formats=args.formats)
+        engine = TaskEngine(store, data_root, country, source, HttpTransport())
+        print(f"[{country}/regulations] fill-fr-text: {len(seeds):,} document(s) missing text")
+        if not seeds:
+            return 0
+        enqueued = sum(engine.store.enqueue(seed)[1] for seed in seeds)
+        resume_report = engine.resume()
+        print(f"[{country}/regulations] fill complete ({enqueued:,} newly enqueued)")
+        for line in resume_report.summary_lines():
+            print(f"  {line}")
+    return 0
+
+
 # -- migrate-layout (one-time, USA 2026-09-01 layout spec) ----------------------------
 #
 # DEVIATION (recorded in layout-migration.md §4.5): this command performs
@@ -1104,6 +1293,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         return _run_repair_documents(args)
     if args.command == "migrate-layout":
         return _run_migrate_layout(args)
+    if args.command == "import-fr-text":
+        return _run_import_fr_text(args)
+    if args.command == "fill-fr-text":
+        return _run_fill_fr_text(args)
     if args.command == "repair-dnk-mainfile":
         return _run_repair_dnk_mainfile(args)
     if args.command == "repair-isl-mainfile":

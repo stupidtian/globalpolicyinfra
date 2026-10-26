@@ -41,7 +41,7 @@ from typing import Any
 from adapters.base import SourceDefinition, TaskSeed
 from adapters.usa.schema import DOMAIN_KEYS, DOMAIN_SCHEMA, DOMAIN_TABLES
 
-__all__ = ["build_source"]
+__all__ = ["build_source", "fill_missing_text_seeds"]
 
 
 def _fail(message: str) -> SystemExit:
@@ -62,6 +62,28 @@ def _split_window(raw: str) -> tuple[str, str]:
     return from_str.strip(), to_str.strip()
 
 
+def fill_missing_text_seeds(store: Any, formats: str = "txt") -> list[TaskSeed]:
+    """fr_detail seeds for every Rule/Proposed row that has no full-text file
+    on record (documents.local_path). The gap-filling channel behind
+    ``cli.py fill-fr-text``: adopted-scraper leftovers, post-scrape
+    publications, and corrections all flow through here — as will routine
+    increments once a sync sweep lands new slim rows."""
+    rows = store.connection.execute(
+        "SELECT f.document_number FROM fr_documents f "
+        "WHERE f.type IN ('Rule', 'Proposed Rule') "
+        "AND NOT EXISTS (SELECT 1 FROM documents d "
+        " WHERE d.entity_ref = 'fr_documents:' || f.document_number "
+        " AND d.local_path IS NOT NULL)"
+    ).fetchall()
+    return [
+        TaskSeed(
+            type="fr_detail",
+            params={"document_number": row["document_number"], "formats": formats},
+        )
+        for row in rows
+    ]
+
+
 def start_tasks(params: dict[str, Any]) -> list[TaskSeed]:
     seeds: list[TaskSeed] = []
     deep = str(params.get("deep", "none")).strip()
@@ -71,6 +93,13 @@ def start_tasks(params: dict[str, Any]) -> list[TaskSeed]:
     cases = [c.strip() for c in str(params.get("cases", "") or "").split(",") if c.strip()]
     max_pages = int(params["max_pages"]) if params.get("max_pages") else None
     is_sync = str(params.get("sync", "")).strip() in ("1", "true", "yes")
+    types = [t.strip() for t in str(params.get("types", "") or "").split(",") if t.strip()]
+    if types:
+        from adapters.usa.sources.regulations.enumerate import TYPE_CODES
+
+        unknown = [t for t in types if t.lower() not in TYPE_CODES and t.upper() not in TYPE_CODES.values()]
+        if unknown:
+            raise _fail(f"unknown type(s) {unknown}; tokens: {sorted(TYPE_CODES)} or the raw codes")
 
     # -- FR chain: a window (explicit or from the sync cursor) or bare cases
     if params.get("window") or is_sync:
@@ -93,6 +122,7 @@ def start_tasks(params: dict[str, Any]) -> list[TaskSeed]:
                     "formats": formats,
                     "cases": cases,
                     "sync": is_sync,
+                    "types": types,
                     **({"max_pages": max_pages} if max_pages else {}),
                 },
             )
