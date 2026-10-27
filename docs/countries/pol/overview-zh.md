@@ -16,6 +16,7 @@ ISAP（Internetowy System Aktów Prawnych，波兰法律文书系统）是这套
 - **时间序列**：✅ 每条目三个原生日期分开收——公布日（promulgation）、公告/签署日（announcementDate）、施行日（entryIntoForce），另有数据变更时间戳（changeDate）；类型、发布机关、语言（pol）、正文文件、可重建 source_url 齐全。
 - **决策过程**：— 未收（Sejm 议会法案过程系统为另一来源，未开）。
 - **版本序列**：✅ 原生——每次编纂（tekst jednolity）以一份公报公告（Obwieszczenie）的形式出版，公告自带位次、公布日与编纂全文，并回链原法；采集按原法→历次公告自动展开，文档经 entity_ref 挂靠原法，一条查询即得"一部法的全部文本状态"。
+- **纯文本层**：✅ 双腿混载清理（2026-10-23 接通 PDF 腿）——HTML 主文件走几何白名单路径，PDF 主文件走测量门槛 + 几何通道 + 错编修复（仅扫描件约 300 份记缺，OCR 界外）。
 
 ## 2. 共享访问准备
 

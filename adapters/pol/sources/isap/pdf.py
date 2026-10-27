@@ -1,17 +1,15 @@
-"""Task type ``isap_pdf``: the act's original PDF.
+"""Task type ``isap_pdf``: the act's original PDF — PDF-primary carrier.
 
 ``GET /eli/acts/DU/{y}/{p}/text.pdf`` — the typeset original (probed
 2026-09-20: DU/2024/1 at 270,714 bytes ``%PDF-1.7``, byte-identical to the
-``/text/O/{fileName}`` inventory copy). Two roles in one task type:
-
-- primary carrier (``doc_id`` + ``record`` in params) for acts with no
-  HTML — the consolidation announcements (their ``textHTML`` is false) and
-  any HTML-less era item: the record travels from the act task in params
-  and THIS task registers the document it downloads, so ``produced_by``
-  separates the two carriers honestly;
-- typeset sibling (bare params) beside a primary HTML — its path travels
-  in the document's ``meta.files`` (declared by the act task at upsert
-  time).
+``/text/O/{fileName}`` inventory copy). This task exists for acts with no
+HTML — the consolidation announcements (their ``textHTML`` is false), the
+2025 fresh-year items and scan-era entries: the record travels from the
+act task in params and THIS task registers the document it downloads, so
+``produced_by`` separates the two carriers honestly (and the clean scope
+stays exact). Acts WITH html do not fetch the typeset PDF at all (user
+ruling 2026-09-22 — the HTML carries the identical text; the endpoint is
+deterministically re-fetchable from the acts row if ever needed).
 
 A response without the ``%PDF`` magic is a loud shape change.
 """

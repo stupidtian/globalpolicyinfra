@@ -21,10 +21,11 @@ reference graph and the text inventory:
 - an announcement carrying ``references["Tekst jednolity dla aktu"]`` is
   recognised as a consolidation: its document points at the BASE act
   (``entity_ref``), giving the version-series axis "one act, many states";
-- text policy: textHTML → ``isap_text`` primary (HTML) + ``isap_pdf``
-  typeset sibling; HTML-only-missing (consolidation announcements) →
-  ``isap_pdf`` primary; neither flag → act row only, no document (the
-  source has no body carrier at all).
+- text policy: textHTML → ``isap_text`` primary (HTML), the typeset PDF
+  NOT fetched (user ruling 2026-10-05 — same text, layout fidelity only,
+  deterministically re-fetchable from the acts row); HTML-only-missing
+  (consolidation announcements) → ``isap_pdf`` primary; neither flag →
+  act row only, no document (the source has no body carrier at all).
 """
 
 from __future__ import annotations
@@ -218,9 +219,11 @@ class IsapActHandler:
         siblings: list[str] = ["act.json"]
         if has_html:
             # HTML-primary: the act task registers the document (it holds
-            # the metadata), the text task fills the primary file, the pdf
-            # task rides in as the typeset sibling.
-            siblings.append("text.pdf")
+            # the metadata) and the text task fills the primary file. The
+            # typeset PDF is NOT fetched (user ruling 2026-10-05): the HTML
+            # carries the identical text, the PDF adds layout fidelity only,
+            # and the endpoint is deterministically re-fetchable later from
+            # the acts row (doc_id is carrier-independent by design).
             meta["files"] = ",".join(siblings)
             next_tasks.append(
                 TaskSeed(
@@ -231,12 +234,6 @@ class IsapActHandler:
                         "pos": pos,
                         "doc_id": doc_id,
                     },
-                )
-            )
-            next_tasks.append(
-                TaskSeed(
-                    type="isap_pdf",
-                    params={"publisher": publisher, "year": year, "pos": pos},
                 )
             )
             title = str(payload.get("title") or "")

@@ -42,7 +42,9 @@ isap_text        the act's HTML text (``/text.html``) — the primary
                  document file when the act has one (textHTML)
 isap_pdf         the act's original PDF (``/text.pdf``) — primary
                  carrier when there is no HTML (consolidation
-                 announcements), else the typeset sibling
+                 announcements, the 2025 fresh-year items, scan-era
+                 entries); acts WITH html do not fetch it (typeset
+                 sibling skipped, user ruling 2026-10-05)
 isap_clean       strips one collected HTML text to plain text
                  (framework-cleaning; targets isap_text only — PDFs
                  are out of cleaning scope, OCR undecided)
@@ -238,15 +240,16 @@ def build_source() -> SourceDefinition:
             "isap_pdf": IsapPdfHandler(),
             "isap_clean": IsapCleanHandler(),
         },
-        # The ELI HTML is a bare document body (h1 + act structure, no site
-        # chrome); text.html files clean with a body-level whitelist. The
-        # targets are the act tasks — isap_act registers every HTML-primary
-        # document (isap_pdf registers PDF-primary ones, out of cleaning
-        # scope until OCR is decided).
+        # Mixed-carrier cleaning (pdf-clean-plan 2026-10-23): the handler
+        # sniffs content magic — %PDF goes through measure/geometry (scans
+        # fail loud), everything else rides the HTML v2 path unchanged.
+        # targets cover BOTH producing tasks: isap_act registers every
+        # HTML-primary document, isap_pdf every PDF-primary one; the bare
+        # v=2 rows mean seeding picks up exactly the PDF leg (21,991).
         clean=CleanDefinition(
             task_type="isap_clean",
             version=CLEAN_VERSION,
-            targets=("isap_act",),
+            targets=("isap_act", "isap_pdf"),
         ),
         domain_schema=DOMAIN_SCHEMA,
         domain_tables=("acts",),
