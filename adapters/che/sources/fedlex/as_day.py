@@ -47,6 +47,16 @@ _XSD_DATE = "^^<http://www.w3.org/2001/XMLSchema#date>"
 
 
 def day_query(day: str) -> str:
+    # The memorial-issue join (isPartOf) is OPTIONAL: at least one work
+    # (eli/oc/2003/521, retro-added by the platform without an issue link)
+    # carries no isPartOf — a required join there silently dropped the work
+    # from its own publication day (found in the final reconciliation,
+    # 2026-10-29: source 2,391 pdf-a vs ledger 2,388 for 2003). The issue
+    # number then simply stays NULL in as_works for such works. Same for
+    # seq/identifier/memorialName: 521 (a repealed work with an odd shape)
+    # also lacks sequenceInTheYearOfPublication and per-language
+    # dct:identifier — the only required patterns are the work's type,
+    # family, publication date and a realized expression with a title.
     return f"""PREFIX jolux: <http://data.legilux.public.lu/resource/ontology/jolux#>
 PREFIX dct: <http://purl.org/dc/terms/>
 PREFIX skos: <http://www.w3.org/2004/02/skos/core#>
@@ -55,17 +65,18 @@ WHERE {{
   ?work a jolux:Act ;
         jolux:legalResourceFamilyType <https://fedlex.data.admin.ch/vocabulary/resource-family/oc> ;
         jolux:publicationDate ?pubDate ;
-        jolux:sequenceInTheYearOfPublication ?seq ;
-        jolux:isPartOf ?issueRes ;
         jolux:isRealizedBy ?expr .
-  ?issueRes jolux:memorialNumber ?issue .
+  OPTIONAL {{ ?work jolux:sequenceInTheYearOfPublication ?seq }}
+  OPTIONAL {{ ?work jolux:isPartOf ?issueRes . ?issueRes jolux:memorialNumber ?issue }}
   OPTIONAL {{ ?work jolux:dateDocument ?docDate }}
   OPTIONAL {{ ?work jolux:dateEntryInForce ?inForce }}
   OPTIONAL {{ ?work jolux:classifiedByTaxonomyEntry ?taxRes . ?taxRes skos:notation ?tax }}
   OPTIONAL {{ ?work jolux:typeDocument ?typeRes . ?typeRes skos:prefLabel ?typeDe . FILTER(LANGMATCHES(LANG(?typeDe), "de")) }}
   OPTIONAL {{ ?work jolux:responsibilityOf ?instRes . ?instRes skos:prefLabel ?instDe . FILTER(LANGMATCHES(LANG(?instDe), "de")) }}
   OPTIONAL {{ ?work jolux:responsibilityOf ?instRes2 . ?instRes2 skos:prefLabel ?instFr . FILTER(LANGMATCHES(LANG(?instFr), "fr")) }}
-  ?expr jolux:language ?langURI ; dct:identifier ?identifier ; jolux:memorialName ?memorialName ; jolux:title ?title .
+  ?expr jolux:language ?langURI ; jolux:title ?title .
+  OPTIONAL {{ ?expr dct:identifier ?identifier }}
+  OPTIONAL {{ ?expr jolux:memorialName ?memorialName }}
   OPTIONAL {{ ?expr jolux:titleShort ?short }}
   OPTIONAL {{ ?m jolux:isExemplifiedBy ?url ; ^jolux:isEmbodiedBy ?expr . OPTIONAL {{ ?m jolux:numberOfPages ?pages }} }}
   BIND (STRAFTER(STR(?langURI), "language/") AS ?lang)
