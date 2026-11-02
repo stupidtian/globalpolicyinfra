@@ -54,6 +54,8 @@ __all__ = [
     "bill_identity",
     "fr_doc_type",
     "fr_folder",
+    "is_error_page",
+    "looks_like_policy_text",
     "normalize_fr_document_number",
     "president_name",
     "yn_flag",
@@ -267,6 +269,47 @@ def bill_folder(congress: int, bill_type: str, number: str | int) -> str:
     (``01_raw/bills/``), per the 2026-09-01 layout spec."""
     _, type_upper, number_str = bill_identity(congress, bill_type, number)
     return f"01_raw/bills/{int(congress)}/{type_upper.upper()}{number_str}"
+
+
+#: HTTP-error templates that a scraper can mistake for document text
+#: (seen in the wild: govinfo 429 pages, exactly 5,014 bytes, saved by a
+#: rate-limited crawl as if they were the documents).
+_ERROR_PAGE_RE = None  # compiled lazily in is_error_page to keep import cheap
+
+_POLICY_MARKER_RE = None
+
+
+def is_error_page(head: bytes) -> bool:
+    """True when the first bytes of a file are an HTTP error template
+    (4xx/5xx title, rate-limit or access-denied boilerplate) rather than
+    document content."""
+    import re
+
+    global _ERROR_PAGE_RE
+    if _ERROR_PAGE_RE is None:
+        _ERROR_PAGE_RE = re.compile(
+            rb"<title>\s*4\d\d|<title>\s*5\d\d"
+            rb"|Too Many Requests|Access Denied|Service Unavailable"
+            rb"|Request Access|Attention Required|cf-browser-verification",
+            re.IGNORECASE,
+        )
+    return bool(_ERROR_PAGE_RE.search(head))
+
+
+def looks_like_policy_text(content: bytes) -> bool:
+    """Cheap sanity check that a fetched body is a real FR rendition: it
+    must carry a known document marker and be more than a stub."""
+    import re
+
+    global _POLICY_MARKER_RE
+    if _POLICY_MARKER_RE is None:
+        _POLICY_MARKER_RE = re.compile(
+            rb"\[FR Doc|Federal Register, Volume|BILLING CODE|<pre", re.IGNORECASE
+        )
+    # length floor is modest (400B): single-page CFR corrections are
+    # genuinely tiny yet complete — the real gates are the error-page
+    # check and the per-document fingerprint in the caller.
+    return len(content) > 400 and bool(_POLICY_MARKER_RE.search(content))
 
 
 def normalize_fr_document_number(document_number: str) -> str:

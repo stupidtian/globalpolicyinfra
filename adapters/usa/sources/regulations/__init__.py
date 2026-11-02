@@ -41,7 +41,7 @@ from typing import Any
 from adapters.base import SourceDefinition, TaskSeed
 from adapters.usa.schema import DOMAIN_KEYS, DOMAIN_SCHEMA, DOMAIN_TABLES
 
-__all__ = ["build_source", "fill_missing_text_seeds"]
+__all__ = ["build_source", "fill_missing_detail_seeds", "fill_missing_text_seeds"]
 
 
 def _fail(message: str) -> SystemExit:
@@ -60,6 +60,33 @@ def _split_window(raw: str) -> tuple[str, str]:
     if not sep or not from_str or not to_str:
         raise _fail(f"window must look like FROM:TO (got {raw!r})")
     return from_str.strip(), to_str.strip()
+
+
+def fill_missing_detail_seeds(store: Any) -> list[TaskSeed]:
+    """fr_detail seeds (metadata-only, ``formats=""``) for every fr_documents
+    row that has no fr_detail task yet — the listing endpoint carries 21
+    fields, the detail endpoint adds subtype/effective_on/comments_close_on/
+    corrections/topics. Dedup is by document_number across ALL existing
+    fr_detail tasks (regardless of their formats param), so text fetched
+    earlier is never re-downloaded."""
+    import json as _json
+
+    detailed: set[str] = set()
+    for row in store.connection.execute(
+        "SELECT params FROM tasks WHERE type = 'fr_detail'"
+    ):
+        try:
+            detailed.add(str(_json.loads(row["params"]).get("document_number", "")))
+        except (ValueError, TypeError):
+            continue
+    rows = store.connection.execute(
+        "SELECT document_number FROM fr_documents"
+    ).fetchall()
+    return [
+        TaskSeed(type="fr_detail", params={"document_number": r["document_number"], "formats": ""})
+        for r in rows
+        if r["document_number"] not in detailed
+    ]
 
 
 def fill_missing_text_seeds(store: Any, formats: str = "txt") -> list[TaskSeed]:

@@ -104,6 +104,14 @@ Fill text gaps (leftovers after adopting an external scrape, plus routine new pu
 python cli.py fill-fr-text --country usa
 ```
 
+Full detail enrichment (backfill the fields the listing endpoint lacks — subtype, effective date, comment deadline, correction links, topics — for every document; an empty `formats` means metadata-only, no text re-download):
+
+```bash
+python cli.py fill-fr-detail --country usa
+```
+
+**type is a section label, not a semantic class (analysis note)**: `type` (Rule/Proposed Rule/Notice/Presidential Document) reflects which section of the daily FR issue a document appears in. The "Proposed Rules" section (77,003 docs total) mixes in procedural actions: by the strict `action`-based cut, true NPRMs number **57,013** — the other ~20k are comment-period extensions (3,261) / reopenings (2,385) / withdrawals (1,674) / ANPRs (1,640) / petition and meeting notices. Use the action cut for a "proposals corpus"; keep the type cut for lifecycle tracking (withdrawals and extensions are themselves lifecycle events). The verbatim `action` strings are in the ledger for re-cutting.
+
 One key difference from bills: **an FR document barely changes once published** (mistakes become separate correction documents linked to the original), so the FR side needs no reopen-on-signal mechanism — incrementals simply chase "publication date > last cursor".
 
 ## 4. Where the Data Lands
@@ -223,4 +231,4 @@ python cli.py requeue --country usa
 
 ---
 
-*Last updated: 2026-10-24 (full-history rules backfill: 197,606 Rule/Proposed docs since 1994-01-03, 105,573 carrying RINs, 32,281 unique RINs; ledger now fr_documents 197,774 — of the rules, 197,005/197,006 (99.999%) carry full text: 183,647 files / 8.68 GB adopted 2026-10-23 from a prior GPO scrape, plus 13,320 fetched 2026-10-24 via fill-fr-text; the single gap (00-6228) has no txt rendition at the source (404), its metadata and html rendition are intact; all 8,695 three-chain RINs have full text — see fr-text-import.md)*
+*Last updated: 2026-11-01 (full-history rules backfill: 197,606 Rule/Proposed docs since 1994-01-03, 105,573 carrying RINs, 32,281 unique RINs; ledger now fr_documents 197,774 — of the rules, 197,005/197,006 (99.999%) carry full text: 183,647 files / 8.68 GB adopted 2026-10-23 from a prior GPO scrape, plus 13,320 fetched 2026-10-24 via fill-fr-text; the single gap (00-6228) has no txt rendition at the source (404), its metadata and html rendition are intact; all 8,695 three-chain RINs have full text; 2026-11-01 full detail enrichment via fill-fr-detail (197,774/197,774, zero failures; effective-date filled 53%, comment deadline 39%, topics 58% — fill rates mirror what the source actually has; NULLs mean the source lacks them) — see fr-text-import.md)*
