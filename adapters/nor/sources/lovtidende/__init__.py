@@ -100,6 +100,7 @@ def build_source() -> SourceDefinition:
     from adapters.nor.sources.lovtidende.clean import (
         CLEAN_VERSION,
         LovtidendeCleanHandler,
+        map_meta,
     )
     from adapters.nor.sources.lovtidende.pack import LtPackHandler
 
@@ -111,13 +112,14 @@ def build_source() -> SourceDefinition:
             "lt_pack": LtPackHandler(),
             "lovtidende_clean": LovtidendeCleanHandler(),
         },
-        # Body rule: pure whitelist on main.documentBody, routed by content
-        # (files are named doc.xml but are 100% HTML, corpus census
-        # 2026-10-05 in docs/tasks/2026-09-03-nor/clean-probe/); version
-        # bumps reseed the whole corpus.
+        # v1 = txt-era flat text; v2 = unified XML (native body, spec
+        # 3.2 semantic block mapping + consumption conventions, ruling
+        # 2026-10-28 — see clean.py and the unified-pilot plan). The v1
+        # .txt files stay on disk untouched; the version bump reseeds.
         clean=CleanDefinition(
             task_type="lovtidende_clean",
             version=CLEAN_VERSION,
             targets=("lt_pack",),
+            map_meta=map_meta,
         ),
     )
