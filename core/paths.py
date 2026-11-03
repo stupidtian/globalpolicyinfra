@@ -47,7 +47,7 @@ __all__ = [
     "chunk_dir",
     "cleaned_dir",
     "cleaned_rel_path",
-    "cleaned_txt_path",
+    "cleaned_xml_path",
     "country_dir",
     "ensure_layout",
     "extracted_dir",
@@ -130,17 +130,20 @@ def state_db_path(data_root: str | Path, country_code: str) -> Path:
 
 
 def cleaned_rel_path(doc_id: str) -> str:
-    """Relative location of one document's cleaned text:
-    ``02_cleaned/{sha256(doc_id)[:2]}/{doc_id}.txt``. Hash-sharded so no
-    single directory ever holds hundreds of thousands of files
+    """Relative location of one document's cleaned product:
+    ``02_cleaned/{sha256(doc_id)[:2]}/{doc_id}.xml`` — the unified XML
+    (unified-xml-spec v1.0, 2026-10-27; the extension was ``.txt`` before
+    the unified era — legacy txt rows stay in the ledger as history,
+    dual-version transition per spec §6). Hash-sharded so no single
+    directory ever holds hundreds of thousands of files
     (framework-cleaning, 2026-09-19). Derived by the framework only —
     country packs never construct this path."""
     shard = hashlib.sha256(doc_id.encode("utf-8")).hexdigest()[:2]
-    return f"02_cleaned/{shard}/{doc_id}.txt"
+    return f"02_cleaned/{shard}/{doc_id}.xml"
 
 
-def cleaned_txt_path(data_root: str | Path, country_code: str, doc_id: str) -> Path:
-    """Absolute path of one document's cleaned text file."""
+def cleaned_xml_path(data_root: str | Path, country_code: str, doc_id: str) -> Path:
+    """Absolute path of one document's cleaned XML product."""
     return country_dir(data_root, country_code) / cleaned_rel_path(doc_id)
 
 

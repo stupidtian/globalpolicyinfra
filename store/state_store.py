@@ -333,6 +333,8 @@ class StateStore:
         task_id: str,
         country_code: str,
         result: TaskResult,
+        *,
+        cleaned_rows: Mapping[str, tuple[str, bytes, int]] | None = None,
     ) -> dict[str, int]:
         """Apply one task's result in a single transaction: task → done,
         domain rows upserted/replaced, documents registered, follow-up tasks
@@ -340,6 +342,12 @@ class StateStore:
 
         Files are written to disk by the engine *before* this call; a crash
         in between leaves harmless orphans (task not done → re-run rewrites).
+
+        ``cleaned_rows`` (unified-xml 2026-10-27): the engine's assembled
+        XML outcomes keyed by doc_id — ``(rel_path, xml_bytes, char_count)``;
+        ``content_length`` is ``len(xml_bytes)``. When absent (direct
+        write_batch callers, pre-XML tests) the legacy derivation from
+        ``CleanedRecord.content`` applies, byte-for-byte as before.
         """
         now = utc_now_iso()
         summary = {"rows": 0, "documents": 0, "tasks": 0, "cursors": 0, "cleaned": 0}
@@ -410,9 +418,22 @@ class StateStore:
 
             for cleaned_record in result.cleaned:
                 # One row per doc_id, newest version wins (the engine has
-                # already written the txt to disk; path is derived, never
+                # already written the product to disk; path is derived, never
                 # country-declared). Cleaning output must NOT touch the
                 # documents row — that is the raw file's identity.
+                # unified-xml: engine-assembled XML outcomes win when present;
+                # the legacy derivation covers direct write_batch callers.
+                if cleaned_rows is not None and cleaned_record.doc_id in cleaned_rows:
+                    rel_path, xml_bytes, char_count = cleaned_rows[cleaned_record.doc_id]
+                    file_hash = hashlib.sha256(xml_bytes).hexdigest()
+                    content_length = len(xml_bytes)
+                else:
+                    assert cleaned_record.content is not None  # XOR contract
+                    rel_path = paths.cleaned_rel_path(cleaned_record.doc_id)
+                    xml_bytes = cleaned_record.content
+                    file_hash = hashlib.sha256(xml_bytes).hexdigest()
+                    content_length = len(xml_bytes)
+                    char_count = len(xml_bytes.decode("utf-8"))
                 conn.execute(
                     "INSERT INTO cleaned (doc_id, version, local_path, file_hash, "
                     "content_length, char_count, task_id, updated_at) "
@@ -425,10 +446,10 @@ class StateStore:
                     (
                         cleaned_record.doc_id,
                         cleaned_record.version,
-                        paths.cleaned_rel_path(cleaned_record.doc_id),
-                        hashlib.sha256(cleaned_record.content).hexdigest(),
-                        len(cleaned_record.content),
-                        len(cleaned_record.content.decode("utf-8")),
+                        rel_path,
+                        file_hash,
+                        content_length,
+                        char_count,
                         task_id,
                         now,
                     ),
@@ -474,6 +495,47 @@ class StateStore:
             "SELECT local_path FROM documents WHERE doc_id = ?", (doc_id,)
         ).fetchone()
         return None if row is None else row["local_path"]
+
+    def get_document_row(self, doc_id: str) -> dict[str, Any] | None:
+        """The full documents row for one doc_id, ``meta`` parsed into a
+        dict (unified-xml 2026-10-27: the header-assembly half of the
+        local_doc channel — the XML header is a read-out of this row).
+        None = no row."""
+        row = self._conn.execute(
+            "SELECT * FROM documents WHERE doc_id = ?", (doc_id,)
+        ).fetchone()
+        if row is None:
+            return None
+        record = dict(row)
+        record["meta"] = json.loads(record.get("meta") or "{}")
+        return record
+
+    def get_domain_row(self, entity_ref: str) -> dict[str, Any] | None:
+        """Resolve one ``{table}:{pk}`` entity_ref to its domain-table row
+        (unified-xml 2026-10-27). The pk column comes from the store's
+        declared ``domain_keys``; unknown table, composite key or missing
+        row → None (header assembly then degrades to the default path)."""
+        table, sep, pk = entity_ref.partition(":")
+        if not sep or table not in self.domain_keys:
+            return None
+        key_columns = self.domain_keys[table]
+        if len(key_columns) != 1:
+            return None  # composite-key entities have no single-row form here
+        try:
+            row = self._conn.execute(
+                f"SELECT * FROM {table} WHERE {key_columns[0]} = ?", (pk,)
+            ).fetchone()
+        except sqlite3.OperationalError:
+            return None
+        return None if row is None else dict(row)
+
+    def iter_cleaned(self) -> list[tuple[str, str]]:
+        """All cleaned rows as ``(doc_id, local_path)`` ordered by doc_id —
+        the derive-txt scan surface (unified-xml 2026-10-27; read-only)."""
+        rows = self._conn.execute(
+            "SELECT doc_id, local_path FROM cleaned ORDER BY doc_id"
+        ).fetchall()
+        return [(row["doc_id"], row["local_path"]) for row in rows]
 
     def clean_pending_targets(
         self, targets: Sequence[str], version: int, *,

@@ -20,6 +20,7 @@ from dataclasses import dataclass, field
 from typing import Any, Protocol
 
 from core.document import DocumentRecord
+from core.unified import Body, Header
 
 __all__ = [
     "BROWSER_ACTIONS",
@@ -198,17 +199,38 @@ class ReplaceRows:
 
 @dataclass(frozen=True)
 class CleanedRecord:
-    """One document's cleaned plain text (framework-cleaning 2026-09-19).
+    """One document's cleaned output (framework-cleaning 2026-09-19;
+    unified-xml 2026-10-27).
 
-    The framework — never the country pack — derives the on-disk path
-    (``02_cleaned/{sha256(doc_id)[:2]}/{doc_id}.txt``) and the ledger row.
-    ``content`` must be deterministic UTF-8 text: ``\\n`` line breaks only,
-    no BOM, exactly one trailing newline; the engine enforces this loudly.
+    The framework — never the country pack — derives the on-disk path and
+    the ledger row. The product is the unified XML (unified-xml-spec
+    v1.0): the engine assembles header (ledger read-out + ``map_meta``)
+    and body into one ``02_cleaned/{sha256(doc_id)[:2]}/{doc_id}.xml``.
+
+    Exactly one content carrier, enforced loudly at construction:
+
+    - ``content`` (compat path): deterministic UTF-8 text — ``\\n`` line
+      breaks only, no BOM, exactly one trailing newline; the engine
+      enforces this loudly and wraps it as a ``flat`` body whose text
+      node is byte-equal to the txt-era product.
+    - ``body`` (native path): a :class:`core.unified.Body` model — the
+      source structure mapped per spec §3.2 (name mapping only, zero
+      rewrite).
     """
 
     doc_id: str
     version: int
-    content: bytes
+    content: bytes | None = None
+    body: Body | None = None
+
+    def __post_init__(self) -> None:
+        # One carrier per record (spec §5.2): content XOR body — both set
+        # or both empty is a loud construction error.
+        if (self.content is None) == (self.body is None):
+            raise ValueError(
+                "CleanedRecord carries exactly one of content (flat compat) "
+                "or body (native) — not both, not neither"
+            )
 
 
 @dataclass
@@ -267,12 +289,23 @@ class CleanDefinition:
     match with rules declared → the shape is escalated (needs_agent, loud);
     no rules at all → every PDF goes to geometry. Routing is fixed
     framework code over this declaration — zero runtime intelligence.
+
+    ``map_meta`` (unified-xml 2026-10-27, spec §5.3): optional pure
+    function ``(doc_row, domain_row) -> Header`` — the country's ledger
+    fields → unified header (identifier schemes, two-level type,
+    authority, native dates as ``other:*``). Called by the engine during
+    assembly with the documents row (``meta`` parsed to a dict) and the
+    ``entity_ref``-resolved domain row (or None). Not provided → the
+    framework default header (fixed columns only: title / published +
+    effective-absent / languages; spec §5.2). Lineage is always
+    engine-filled — map_meta never touches it.
     """
 
     task_type: str
     version: int
     targets: tuple[str, ...]  # producing task types whose docs are cleanable
     pdf_rules: tuple[PdfRule, ...] = ()
+    map_meta: Callable[[dict[str, Any], dict[str, Any] | None], Header] | None = None
 
 
 @dataclass(frozen=True)

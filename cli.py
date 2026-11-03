@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import argparse
 import sys
-from collections.abc import Sequence
+from collections.abc import Iterator, Sequence
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -26,6 +26,7 @@ from core.config import (
     resolve_data_root,
     write_config,
 )
+from core.unified import Division, parse_xml
 from runtime.engine import TaskEngine
 from runtime.proclock import CollectLock, LockBusyError
 from runtime.stages import pdf_mineru
@@ -152,6 +153,22 @@ def build_parser() -> argparse.ArgumentParser:
         help="Explicit config file location (default: ~/.globalpolicyinfra/config.toml).",
     )
 
+    derive_parser = subparsers.add_parser(
+        "derive-txt",
+        help="Derive plain text from the cleaned XML products (unified-xml "
+        "transition: consumers that still want .txt files).",
+    )
+    derive_parser.add_argument("--country", required=True, help="ISO3 code, e.g. usa")
+    derive_parser.add_argument(
+        "--out", required=True,
+        help="Output directory for the derived .txt files (created if missing; "
+        "the framework creates nothing inside the data root).",
+    )
+    derive_parser.add_argument(
+        "--config-file", default=None,
+        help="Explicit config file location (default: ~/.globalpolicyinfra/config.toml).",
+    )
+
     requeue_parser = subparsers.add_parser(
         "requeue", help="Repair channel: un-fail failed/escalated tasks back to pending."
     )
@@ -234,6 +251,40 @@ def build_parser() -> argparse.ArgumentParser:
         help="Text formats to fetch (default txt; e.g. txt,xml)",
     )
     fill_parser.add_argument(
+        "--config-file", default=None,
+        help="Explicit config file location (default: ~/.globalpolicyinfra/config.toml).",
+    )
+
+    detail_parser = subparsers.add_parser(
+        "fill-fr-detail",
+        help="Backfill detail metadata for all FR documents lacking a detail task.",
+    )
+    detail_parser.add_argument("--country", required=True, help="ISO3 code, e.g. usa")
+    detail_parser.add_argument(
+        "--config-file", default=None,
+        help="Explicit config file location (default: ~/.globalpolicyinfra/config.toml).",
+    )
+
+    refix_parser = subparsers.add_parser(
+        "refix-fr-text",
+        help="Re-download listed FR texts whose files are error-page artifacts.",
+    )
+    refix_parser.add_argument("--country", required=True, help="ISO3 code, e.g. usa")
+    refix_parser.add_argument("--list", required=True, help="CSV with a document_number column")
+    refix_parser.add_argument(
+        "--fallback-html", action="store_true",
+        help="DEPRECATED (kept for compatibility): use --source auto instead",
+    )
+    refix_parser.add_argument(
+        "--source", choices=("auto", "txt", "html", "govinfo"), default="auto",
+        help="Which rendition to fetch: auto chains txt -> html -> govinfo granule; "
+             "govinfo goes straight to the GPO mirror (bypasses FR's WAF)",
+    )
+    refix_parser.add_argument(
+        "--apply", action="store_true",
+        help="Execute (default: dry run)",
+    )
+    refix_parser.add_argument(
         "--config-file", default=None,
         help="Explicit config file location (default: ~/.globalpolicyinfra/config.toml).",
     )
@@ -611,6 +662,51 @@ def _clean_run_types(source: SourceDefinition, decl: CleanDefinition) -> set[str
     return types
 
 
+def _run_derive_txt(args: argparse.Namespace) -> int:
+    """``derive-txt`` (unified-xml 2026-10-27, spec §5.4): one-step plain
+    text from the cleaned XML products — flat = the text node verbatim
+    (byte-equal to the txt-era product); native/derived = all ``p`` texts
+    in document order joined by blank lines. Ledger read-only: no lock,
+    no cleaned-table writes; legacy ``.txt`` rows are skipped (counted)."""
+    try:
+        data_root = resolve_data_root(config_path=args.config_file)
+    except ConfigError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    country = args.country.upper()
+    country_root = paths.country_dir(data_root, country)
+    out_dir = Path(args.out)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    def blocks(div: Division) -> Iterator[str]:
+        for block in div.ps:
+            yield block.text
+        for child in div.divisions:
+            yield from blocks(child)
+
+    with StateStore.for_country(data_root, country) as store:
+        rows = store.iter_cleaned()
+    derived = skipped = 0
+    for doc_id, rel_path in rows:
+        if not rel_path.endswith(".xml"):
+            skipped += 1  # legacy txt-era row: kept as history, not derived
+            continue
+        document = parse_xml((country_root / rel_path).read_bytes())
+        if document.body.structure == "flat":
+            assert document.body.text is not None  # XOR enforced on the model
+            text = document.body.text
+        else:
+            parts = [t for div in document.body.divisions for t in blocks(div)]
+            text = ("\n\n".join(parts) + "\n") if parts else ""
+        (out_dir / f"{doc_id}.txt").write_bytes(text.encode("utf-8"))
+        derived += 1
+    print(
+        f"[{country}] derived {derived} txt file(s) into {out_dir}"
+        + (f" ({skipped} legacy row(s) skipped)" if skipped else "")
+    )
+    return 0
+
+
 def _run_status(args: argparse.Namespace) -> int:
     try:
         data_root = resolve_data_root(config_path=args.config_file)
@@ -868,6 +964,179 @@ def _run_fill_fr_text(args: argparse.Namespace) -> int:
         print(f"[{country}/regulations] fill complete ({enqueued:,} newly enqueued)")
         for line in resume_report.summary_lines():
             print(f"  {line}")
+    return 0
+
+
+def _run_fill_fr_detail(args: argparse.Namespace) -> int:
+    from adapters.usa.sources.regulations import fill_missing_detail_seeds
+
+    try:
+        data_root = resolve_data_root(config_path=args.config_file)
+    except ConfigError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    country = args.country.upper()
+    try:
+        source = get_source(country, "regulations")
+    except RegistryError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    paths.ensure_layout(data_root, country)
+    with StateStore.for_country(
+        data_root, country, domain_schema=source.domain_schema,
+        domain_keys=source.domain_keys,
+    ) as store:
+        seeds = fill_missing_detail_seeds(store)
+        engine = TaskEngine(store, data_root, country, source, HttpTransport())
+        print(f"[{country}/regulations] fill-fr-detail: {len(seeds):,} document(s) missing detail "
+              "(metadata-only, no text downloads)")
+        if not seeds:
+            return 0
+        enqueued = sum(engine.store.enqueue(seed)[1] for seed in seeds)
+        resume_report = engine.resume()
+        print(f"[{country}/regulations] fill complete ({enqueued:,} newly enqueued)")
+        for line in resume_report.summary_lines():
+            print(f"  {line}")
+    return 0
+
+
+def _run_refix_fr_text(args: argparse.Namespace) -> int:
+    import csv
+    import hashlib
+    import time
+
+    import requests
+
+    from adapters.usa.schema import is_error_page, looks_like_policy_text
+
+    try:
+        data_root = resolve_data_root(config_path=args.config_file)
+    except ConfigError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    country = args.country.upper()
+    country_root = paths.country_dir(data_root, country)
+    list_path = Path(args.list)
+    if not list_path.is_file():
+        print(f"error: {list_path} not found", file=sys.stderr)
+        return 1
+    with open(list_path, encoding="utf-8", newline="") as fh:
+        docnums = [row["document_number"] for row in csv.DictReader(fh)]
+
+    with StateStore.for_country(data_root, country) as store:
+        conn = store.connection
+        targets = []
+        for docnum in docnums:
+            fr = conn.execute(
+                "SELECT raw_text_url FROM fr_documents WHERE document_number = ?",
+                (docnum,),
+            ).fetchone()
+            doc = conn.execute(
+                "SELECT doc_id, local_path, meta FROM documents "
+                "WHERE entity_ref = ? AND local_path IS NOT NULL",
+                (f"fr_documents:{docnum}",),
+            ).fetchone()
+            if fr and doc:
+                targets.append((docnum, fr["raw_text_url"], doc))
+        print(f"[{country}] refix list: {len(docnums):,} documents, "
+              f"{len(targets):,} with ledger text + source URL")
+        if not targets:
+            return 0
+        if not args.apply:
+            print("dry run — pass --apply to execute")
+            return 0
+
+        session = requests.Session()
+        session.headers.update({"User-Agent": "globalpolicyinfra-refix/1.0"})
+        fixed: list[str] = []
+        failed: list[tuple[str, str]] = []
+        fr_meta = conn.execute(
+            "SELECT document_number, html_url, publication_date FROM fr_documents"
+        ).fetchall()
+        html_urls = {r["document_number"]: r["html_url"] for r in fr_meta}
+        govinfo_urls = {
+            r["document_number"]:
+                f"https://www.govinfo.gov/content/pkg/FR-{r['publication_date']}"
+                f"/html/{r['document_number']}.htm"
+            for r in fr_meta if r["publication_date"]
+        }
+
+        def _fetch_valid(url: str, docnum: str) -> bytes | None:
+            """One download, verified against THIS document's fingerprint:
+            200 + strict policy markers + not any known error/block page +
+            the document's own number printed in the body (the refix lesson:
+            the site's WAF serves 200 block pages that satisfy loose marker
+            checks). Block pages trigger a backoff retry, up to 3 attempts."""
+            for attempt in range(3):
+                resp = session.get(url, timeout=30)
+                body = resp.content
+                if (resp.status_code == 200
+                        and not is_error_page(body[:800])
+                        and looks_like_policy_text(body)
+                        and docnum.encode() in body):
+                    return body
+                if resp.status_code == 200 and is_error_page(body[:800]):
+                    time.sleep(45 * (attempt + 1))  # WAF block: back off, retry
+                    continue
+                return None  # 404 / wrong shape: no point retrying
+            return None
+
+        for i, (docnum, url, doc) in enumerate(targets, 1):
+            try:
+                body = None
+                # source chain, in order: the requested source first, then
+                # the remaining ones as fallbacks (govinfo is a different
+                # domain — it survives federalregister.gov's WAF blocks)
+                chain = {
+                    "txt": [url] if url else [],
+                    "html": [html_urls.get(docnum)] if html_urls.get(docnum) else [],
+                    "govinfo": [govinfo_urls.get(docnum)] if govinfo_urls.get(docnum) else [],
+                    "auto": [u for u in (url, html_urls.get(docnum),
+                                         govinfo_urls.get(docnum)) if u],
+                }[args.source]
+                for source_url in chain:
+                    body = _fetch_valid(source_url, docnum)
+                    if body is not None:
+                        break
+                if body is not None:
+                    p = country_root / doc["local_path"]
+                    p.parent.mkdir(parents=True, exist_ok=True)
+                    p.write_bytes(body)
+                    import json as _json
+                    meta = _json.loads(doc["meta"] or "{}")
+                    meta["refix_2026_11"] = "replaced error-page artifact via official raw_text_url"
+                    conn.execute(
+                        "UPDATE documents SET file_hash = ?, content_length = ?, "
+                        "raw_format = ?, meta = ?, produced_by = 'fr_text_refix' "
+                        "WHERE doc_id = ?",
+                        (hashlib.sha256(body).hexdigest(), len(body),
+                         "html" if body[:1] == b"<" else "txt",
+                         _json.dumps(meta, ensure_ascii=False, sort_keys=True),
+                         doc["doc_id"]),
+                    )
+                    fixed.append(docnum)
+                else:
+                    failed.append((docnum, "download/validation failed (txt+html)"))
+            except requests.RequestException as exc:
+                failed.append((docnum, str(exc)[:80]))
+            if i % 500 == 0:
+                conn.commit()
+                print(f"  {i:,}/{len(targets):,} (fixed {len(fixed):,}, failed {len(failed):,})")
+            time.sleep(0.8)
+        conn.commit()
+        from datetime import UTC as _UTC
+        from datetime import datetime as _dt
+        conn.execute(
+            "INSERT INTO events (ts, entity_type, subject_id, stage, from_status, "
+            "to_status, detail) VALUES (?, 'documents', 'fr_text_refix', NULL, NULL, "
+            "'applied', ?)",
+            (_dt.now(_UTC).isoformat().replace("+00:00", "Z"),
+             f"refix {len(fixed)} error-page artifacts; {len(failed)} unfixed"),
+        )
+        conn.commit()
+    print(f"[{country}] refix complete: fixed {len(fixed):,}, failed {len(failed):,}")
+    for docnum, why in failed[:20]:
+        print(f"  FAILED {docnum}: {why}")
     return 0
 
 
@@ -1285,6 +1554,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         return _run_status(args)
     if args.command == "export":
         return _run_export(args)
+    if args.command == "derive-txt":
+        return _run_derive_txt(args)
     if args.command == "requeue":
         return _run_requeue(args)
     if args.command == "reset":
@@ -1297,6 +1568,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         return _run_import_fr_text(args)
     if args.command == "fill-fr-text":
         return _run_fill_fr_text(args)
+    if args.command == "fill-fr-detail":
+        return _run_fill_fr_detail(args)
+    if args.command == "refix-fr-text":
+        return _run_refix_fr_text(args)
     if args.command == "repair-dnk-mainfile":
         return _run_repair_dnk_mainfile(args)
     if args.command == "repair-isl-mainfile":

@@ -33,6 +33,15 @@ from typing import Any, Literal
 from adapters.base import Response, SourceDefinition, TaskResult, TaskSeed, TaskView
 from core import paths
 from core.state import Status
+from core.unified import (
+    Body,
+    Division,
+    Lineage,
+    UnifiedDocument,
+    default_header,
+    parse_xml,
+    to_xml,
+)
 from runtime.errors import PermanentError, TransientError
 from runtime.retry import RetryPolicy
 from runtime.transport.http import Transport
@@ -354,8 +363,10 @@ class TaskEngine:
                 self._archive_failure(task, response, "empty result")
             try:
                 self._write_files(result)
-                self._write_cleaned(result)
-                summary = self.store.write_batch(task_id, self.country_code, result)
+                cleaned_rows = self._write_cleaned(task_id, result)
+                summary = self.store.write_batch(
+                    task_id, self.country_code, result, cleaned_rows=cleaned_rows
+                )
             except PermanentError as exc:
                 self.store.record_task_outcome(
                     task_id, Status.FAILED_PERMANENT, error=_describe(exc)
@@ -540,8 +551,10 @@ class TaskEngine:
 
         try:
             self._write_files(result)
-            self._write_cleaned(result)
-            summary = self.store.write_batch(task_id, self.country_code, result)
+            cleaned_rows = self._write_cleaned(task_id, result)
+            summary = self.store.write_batch(
+                task_id, self.country_code, result, cleaned_rows=cleaned_rows
+            )
         except PermanentError as exc:
             self.store.record_task_outcome(
                 task_id, Status.FAILED_PERMANENT, error=_describe(exc)
@@ -593,26 +606,89 @@ class TaskEngine:
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_bytes(file_out.content)
 
-    def _write_cleaned(self, result: Any) -> None:
-        """Write cleaned texts to their framework-derived paths (before
-        write_batch, files-style: a crash in between leaves an orphan the
-        re-run rewrites). The path is derived from doc_id alone — country
-        packs never specify it — and the determinism contract is enforced
-        loudly (framework-cleaning 2.2)."""
+    def _write_cleaned(
+        self, task_id: str, result: Any
+    ) -> dict[str, tuple[str, bytes, int]]:
+        """Assemble and write the unified XML products (unified-xml-spec
+        v1.0, 2026-10-27) for one task's CleanedRecords, before write_batch
+        (files-style: a crash in between leaves an orphan the re-run
+        rewrites). The path is derived from doc_id alone — country packs
+        never specify it.
+
+        Assembly pipeline (spec §5.2): documents row (+ domain row via
+        entity_ref) → ``map_meta`` or the default header → lineage +
+        root attrs (engine context) → body (record.body, or the compat
+        flat wrap of record.content) → ``to_xml`` → **readback gate**
+        (parse_xml == model, else Permanent — nothing reaches disk) →
+        write ``.xml``. Returns the materialized outcomes for the ledger:
+        ``{doc_id: (rel_path, xml_bytes, char_count)}``.
+
+        The content compat path keeps its determinism contract (BOM / CR /
+        trailing newline) — enforced here, loudly — and its text node is
+        byte-equal to the txt-era product (spec §3.3)."""
+        decl = self.source.clean
+        outcomes: dict[str, tuple[str, bytes, int]] = {}
         for record in result.cleaned:
-            content = record.content
-            if (
-                content.startswith(b"\xef\xbb\xbf")
-                or b"\r" in content
-                or not content.endswith(b"\n")
-            ):
+            doc_row = self.store.get_document_row(record.doc_id)
+            if doc_row is None:
                 raise PermanentError(
-                    f"cleaned output for {record.doc_id} violates the determinism "
-                    "contract (BOM / CR / trailing newline)"
+                    f"cleaned record for unknown doc_id {record.doc_id!r} — "
+                    "no documents row to assemble the header from"
                 )
-            target = self.country_root / paths.cleaned_rel_path(record.doc_id)
+            if record.body is not None:
+                body = record.body
+            else:
+                content = record.content
+                assert content is not None  # CleanedRecord XOR contract
+                if (
+                    content.startswith(b"\xef\xbb\xbf")
+                    or b"\r" in content
+                    or not content.endswith(b"\n")
+                ):
+                    raise PermanentError(
+                        f"cleaned output for {record.doc_id} violates the "
+                        "determinism contract (BOM / CR / trailing newline)"
+                    )
+                body = Body(structure="flat", text=content.decode("utf-8"))
+            if decl is not None and decl.map_meta is not None:
+                domain_row = (
+                    self.store.get_domain_row(doc_row["entity_ref"])
+                    if doc_row.get("entity_ref")
+                    else None
+                )
+                header = decl.map_meta(doc_row, domain_row)
+            else:
+                header = default_header(doc_row)
+            header.lineage = Lineage(
+                source_url=str(doc_row.get("source_url") or ""),
+                produced_by=str(doc_row.get("produced_by") or ""),
+                raw_path=str(doc_row.get("local_path") or ""),
+                clean_version=str(record.version),
+                clean_task=task_id,
+            )
+            document = UnifiedDocument(
+                country=self.country_code,
+                source=self.source.name,
+                doc_id=record.doc_id,
+                lang=(doc_row.get("language") or "").strip() or None,
+                header=header,
+                body=body,
+            )
+            xml_bytes = to_xml(document)
+            # Readback gate (spec §4.2): every product must parse back to
+            # the model it claims to be — fail loud, write nothing.
+            if parse_xml(xml_bytes) != document:
+                raise PermanentError(
+                    f"readback gate failed for {record.doc_id!r}: "
+                    "parse_xml(to_xml(doc)) != doc — nothing written"
+                )
+            rel_path = paths.cleaned_rel_path(record.doc_id)
+            target = self.country_root / rel_path
             target.parent.mkdir(parents=True, exist_ok=True)
-            target.write_bytes(content)
+            target.write_bytes(xml_bytes)
+            char_count = _body_char_count(body)
+            outcomes[record.doc_id] = (rel_path, xml_bytes, char_count)
+        return outcomes
 
     def _archive_failure(self, task: dict[str, Any], response: Response, reason: str) -> None:
         failures_dir = self.country_root / "failures" / task["task_id"]
@@ -666,3 +742,22 @@ class _IOOutcome:
 
 def _describe(exc: Exception) -> str:
     return f"{type(exc).__name__}: {exc}"
+
+
+def _body_char_count(body: Body) -> int:
+    """The cleaned-table ``char_count`` (spec §5.2): flat = len(text);
+    native/derived = the recursive sum of all ``p`` text lengths."""
+    if body.structure == "flat":
+        assert body.text is not None  # XOR enforced on the model
+        return len(body.text)
+    total = 0
+
+    def walk(div: Division) -> None:
+        nonlocal total
+        total += sum(len(block.text) for block in div.ps)
+        for child in div.divisions:
+            walk(child)
+
+    for division in body.divisions:
+        walk(division)
+    return total
