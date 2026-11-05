@@ -5,8 +5,14 @@ the source's own Juurakt schema (probed 2026-10-27, samples in the task
 folder). One response carries the bibliographic block AND the body, so one
 request is one document:
 
-- the raw XML is stored verbatim as the primary file
-  (``01_raw/riigiteataja/{publication year}/{globaalID}.xml``);
+- the raw XML is stored **gzip-compressed** as the primary file
+  (``01_raw/riigiteataja/{publication year}/{globaalID}.xml.gz``) —
+  verbatim-but-compressed storage keeps the as-published guarantee at
+  ~4% of the raw size (Juurakt XML compresses extremely well, measured
+  2026-10-27); the file hash is the checksum of the stored (compressed)
+  bytes, per contract. ``mtime=0`` makes the gzip bytes deterministic:
+  a re-fetch reproduces the exact same file, so file_hash is stable
+  across runs;
 - the bibliographic block (``metaandmed``) is parsed into the documents
   row: publication mark (part / date / issue / article — the timeline
   date), adoption and promulgation dates, validity window, issuing
@@ -27,6 +33,7 @@ Estonian-language one); answered as an explained empty, task still done.
 
 from __future__ import annotations
 
+import gzip
 import json
 import re
 from xml.etree import ElementTree
@@ -287,6 +294,9 @@ class ActHandler:
         scope = str(task.params.get("scope_slice", ""))
         if scope:
             meta_out["scope_slice"] = scope
+        channel = str(task.params.get("channel", ""))
+        if channel:
+            meta_out["channel"] = channel
 
         title_el = _child(root, "aktinimi")
         title = _grandchild_text(title_el, "nimi", "pealkiri") if title_el is not None else None
@@ -318,8 +328,10 @@ class ActHandler:
             documents=[record],
             files=[
                 FileOut(
-                    path=f"{folder}/{act_id}.xml",
-                    content=response.content,
+                    path=f"{folder}/{act_id}.xml.gz",
+                    # mtime=0: deterministic gzip bytes — a re-fetch
+                    # reproduces the identical file and file_hash.
+                    content=gzip.compress(response.content, 9, mtime=0),
                     doc_id=doc_id,
                 )
             ],

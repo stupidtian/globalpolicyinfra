@@ -48,6 +48,7 @@ def _act_seed(row: dict[str, Any], scope: str) -> TaskSeed:
             "valjaandja": str(row.get("valjaandja") or ""),
             "title": str(row.get("pealkiri") or ""),
             "scope_slice": scope,
+            "channel": "current",
         },
         signal=str(row.get("muudetud") or ""),
     )

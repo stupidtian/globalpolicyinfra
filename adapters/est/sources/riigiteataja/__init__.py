@@ -74,9 +74,12 @@ __all__ = [
     "API_BASE",
     "CURSORLESS_NOTE",
     "DEFAULT_PAGE_SIZE",
+    "LAYERS",
     "PUBLIC_API_BASE",
+    "REQUEST_HEADERS",
     "SITE_BASE",
     "build_source",
+    "is_court_issuer",
     "is_municipal_issuer",
     "site_url_for",
     "start_tasks",
@@ -136,6 +139,19 @@ def is_municipal_issuer(issuer: str) -> bool:
     return any(marker in lowered for marker in MUNICIPAL_MARKERS)
 
 
+def is_court_issuer(issuer: str) -> bool:
+    """True when the issuer names a court. Court decisions ride in the
+    algtekst search corpus (probed 2026-11-05: keyword searches surface
+    Riigikohtu rows) but are out of scope here — every Estonian court is
+    named <...> Kohus (nominative, e.g. Harju Maakohus) or appears in a
+    genitive/compound form Riigi-kohtu / maakohu-tu, so the two
+    substrings ``kohus`` and ``kohtu`` cover the whole declension while
+    matching no non-court state body (the Ministry of Justice is
+    Justiitsministeerium)."""
+    lowered = issuer.strip().lower()
+    return "kohus" in lowered or "kohtu" in lowered
+
+
 def site_url_for(globaal_id: str) -> str:
     """The canonical, rebuildable site address of one act version (the
     form the source itself writes into the XML ``aktViide`` field,
@@ -150,7 +166,8 @@ def _fail(message: str) -> SystemExit:
         "  python cli.py collect --country est --source riigiteataja pages=1:2\n"
         "  python cli.py collect --country est --source riigiteataja refresh=2026-10-27T00:00:00Z\n"
         "  python cli.py collect --country est --source riigiteataja pages=1:2 dokument=seadus\n"
-        "  python cli.py collect --country est --source riigiteataja pages=1:2 scope=all\n"
+        "  python cli.py collect --country est --source riigiteataja layer=algtekst offsets=0:300\n"
+        "  python cli.py collect --country est --source riigiteataja layer=algtekst\n"
         "  python cli.py status --country est --source riigiteataja\n"
         f"  ({CURSORLESS_NOTE})"
     )
@@ -185,8 +202,67 @@ def _parse_scope(raw: str) -> str:
     return scope
 
 
+def _parse_offsets(raw: str) -> tuple[int, int | None]:
+    """``A:B`` (walk offsets A .. B exclusive) or ``A`` (to the empty tail)."""
+    from_str, sep, to_str = raw.partition(":")
+    try:
+        start = int(from_str.strip())
+    except ValueError:
+        raise _fail(f"offsets must look like A:B or A (got {raw!r})") from None
+    if start < 0:
+        raise _fail(f"offsets start must be >= 0 (got {raw!r})")
+    if not sep or not to_str.strip():
+        return start, None
+    try:
+        end = int(to_str.strip())
+    except ValueError:
+        raise _fail(f"offsets must look like A:B or A (got {raw!r})") from None
+    if end <= start:
+        raise _fail(f"offsets end {end} must be after its start {start}")
+    return start, end
+
+
+#: Text layers of the source. "current" (default) walks the version
+#: inventory (rt_sweep, one row per version ever in force — consolidated
+#: texts included); "algtekst" walks the as-published layer (rt_alglist,
+#: one row per adoption-time original). The two are complementary, not
+#: alternatives: the same unamended act resolves to the same document id
+#: in both channels and the engine dedupes it.
+LAYERS: tuple[str, ...] = ("current", "algtekst")
+
+
 def start_tasks(params: dict[str, Any]) -> list[TaskSeed]:
     scope = _parse_scope(str(params.get("scope", "state")))
+    layer = str(params.get("layer", "current")).strip().lower()
+    if layer not in LAYERS:
+        raise _fail(f"layer must be one of {'/'.join(LAYERS)} (got {layer!r})")
+    refresh = str(params.get("refresh", "")).strip()
+
+    if layer == "algtekst":
+        if "pages" in params:
+            raise _fail("pages belongs to the current layer; give offsets= for layer=algtekst")
+        if params.get("dokument"):
+            raise _fail("dokument belongs to the current layer (the algtekst search has no type filter)")
+        if "offsets" in params:
+            offsets_raw = str(params["offsets"]).strip()
+            if not offsets_raw:
+                raise _fail("offsets must look like A:B or A (got an empty value)")
+            start, end = _parse_offsets(offsets_raw)
+        else:
+            # no offsets = the full walk: offset 0 until the empty tail
+            start, end = 0, None
+        list_params: dict[str, Any] = {"scope": scope}
+        if refresh:
+            list_params["refresh"] = refresh
+        if end is not None:
+            list_params["offsets_end"] = str(end)
+        return [
+            TaskSeed(type="rt_alglist", params={**list_params, "offset": str(start)}),
+            TaskSeed(type="rt_classifiers", params={}),
+        ]
+
+    if "offsets" in params:
+        raise _fail("offsets belongs to layer=algtekst; give pages= for the current layer")
 
     sweep_params: dict[str, Any] = {"scope": scope}
     if params.get("dokument"):
@@ -194,7 +270,6 @@ def start_tasks(params: dict[str, Any]) -> list[TaskSeed]:
         if not dokument:
             raise _fail("dokument must be a non-empty native type (e.g. seadus)")
         sweep_params["dokument"] = dokument
-    refresh = str(params.get("refresh", "")).strip()
     if refresh:
         sweep_params["refresh"] = refresh
 
@@ -217,6 +292,7 @@ def start_tasks(params: dict[str, Any]) -> list[TaskSeed]:
 
 def build_source() -> SourceDefinition:
     from adapters.est.sources.riigiteataja.act import ActHandler
+    from adapters.est.sources.riigiteataja.alg import AlgListHandler
     from adapters.est.sources.riigiteataja.classifiers import ClassifiersHandler
     from adapters.est.sources.riigiteataja.sweep import SweepHandler
 
@@ -226,6 +302,7 @@ def build_source() -> SourceDefinition:
         task_types={
             "rt_sweep": SweepHandler(),
             "rt_act": ActHandler(),
+            "rt_alglist": AlgListHandler(),
             "rt_classifiers": ClassifiersHandler(),
         },
         parallel_safe=True,  # key-free stateless APIs, no cookies (probed 2026-10-27)
