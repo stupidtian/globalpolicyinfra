@@ -35,7 +35,7 @@ class PdfHandler:
             url=article_pdf_url_for(
                 int(task.params["year"]),
                 int(task.params["issue"]),
-                int(task.params["art"]),
+                task.params["art"],
             )
         )
 
@@ -43,7 +43,7 @@ class PdfHandler:
         year, issue, ordinal = (
             int(task.params["year"]),
             int(task.params["issue"]),
-            int(task.params["art"]),
+            task.params["art"],
         )
         label = f"nn_pdf {year}/{issue}/{ordinal}"
         content = response.content

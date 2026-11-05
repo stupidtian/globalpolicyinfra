@@ -78,6 +78,13 @@ def map_doc_type(native_type: str) -> str:
     return _NATIVE_TO_TYPE.get(native_type.strip().casefold(), "OTHER")
 
 
+def _norm_ordinal(raw: str) -> str:
+    """Ordinal comparison form: digit strings lose their zero padding
+    ("0000" -> "0"), anything else (letter suffixes like "156a") compares
+    verbatim."""
+    return str(int(raw)) if raw.isdigit() else raw
+
+
 def _clean(raw: str) -> str:
     return " ".join(unescape(_TAG_RE.sub(" ", raw)).split())
 
@@ -157,15 +164,18 @@ class DocHandler:
             url=site_url_for(
                 int(task.params["year"]),
                 int(task.params["issue"]),
-                int(task.params["art"]),
+                task.params["art"],
             )
         )
 
     def parse(self, response: Response, task: TaskView) -> TaskResult:
+        # art travels verbatim: int for clean ordinals, the export's own
+        # spelling ("156a", "0000") for irregular ones — the platform
+        # answers the verbatim form ("/102/0" 404s, probed 2026-11-05).
         year, issue, ordinal = (
             int(task.params["year"]),
             int(task.params["issue"]),
-            int(task.params["art"]),
+            task.params["art"],
         )
         label = f"nn_doc {year}/{issue}/{ordinal}"
         try:
@@ -190,13 +200,11 @@ class DocHandler:
                 "item identity drift"
             )
         page_ordinal_raw = meta.get("Broj dokumenta u izdanju", "")
-        if page_ordinal_raw:
-            page_ordinal = int(page_ordinal_raw)
-            if page_ordinal != ordinal:
-                raise ValueError(
-                    f"{label}: page ordinal {page_ordinal} != requested {ordinal} — "
-                    "item identity drift"
-                )
+        if page_ordinal_raw and _norm_ordinal(page_ordinal_raw) != _norm_ordinal(str(ordinal)):
+            raise ValueError(
+                f"{label}: page ordinal {page_ordinal_raw!r} != requested "
+                f"{ordinal!r} — item identity drift"
+            )
         seed_issuer = str(task.params.get("issuer", "")).strip()
         page_issuer = meta.get("Donositelj", "").strip()
         if (

@@ -103,14 +103,14 @@ def is_court_issuer(issuer: str) -> bool:
     return any(token in tokens for token in _COURT_TOKENS)
 
 
-def site_url_for(year: int, issue: int, ordinal: int) -> str:
+def site_url_for(year: int, issue: int, ordinal: int | str) -> str:
     """The canonical, rebuildable ELI address of one gazette item (the
     form the source's own inventory CSV writes into its link column and
     the item page echoes in its ELI field)."""
     return f"{SITE_BASE}/eli/sluzbeni/{year}/{issue}/{ordinal}"
 
 
-def article_pdf_url_for(year: int, issue: int, ordinal: int) -> str:
+def article_pdf_url_for(year: int, issue: int, ordinal: int | str) -> str:
     """The per-item PDF address (2023+; the item page's pdf-view iframe
     src is exactly this form)."""
     return f"{site_url_for(year, issue, ordinal)}/pdf"

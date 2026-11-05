@@ -102,20 +102,10 @@ class IndexHandler:
                     f"{label}: row of issue {issue_label!r} inside the "
                     f"{year} export — cross-year row is an explained shape"
                 )
-            raw_ordinal = (row.get("Broj dokumenta") or "").strip()
-            try:
-                ordinal = int(raw_ordinal)
-            except ValueError:
-                raise ValueError(
-                    f"{label}: unparseable item ordinal {raw_ordinal!r}"
-                ) from None
-            link = (row.get("Poveznica") or "").strip()
-            expected_link = site_url_for(year, issue_no, ordinal)
-            if link != expected_link:
-                raise ValueError(
-                    f"{label}: link column {link!r} does not match the "
-                    f"ELI form {expected_link!r} — identity basis drift"
-                )
+            # Scope filtering runs BEFORE identity validation: rows outside
+            # the corpus are not collected, so their shapes are not ours to
+            # enforce (the 2024 export carries a court row whose ordinal
+            # spells "0000" — real, but out of scope under the user ruling).
             if issues_window is not None and not (
                 issues_window[0] <= issue_no <= issues_window[1]
             ):
@@ -123,6 +113,26 @@ class IndexHandler:
             issuer = (row.get("Donositelj dokumenta") or "").strip()
             if scope == "policy" and is_court_issuer(issuer):
                 continue
+            # The item ordinal is the ELI's third segment, spelled verbatim
+            # in the export (probed 2026-11-05: letter suffixes "156a" and
+            # zero-padding "0000" both exist; the padded form is the one the
+            # platform answers — "/102/0" 404s while "/102/0000" works).
+            # Clean rows keep int params (task-identity stability with
+            # already-collected items); irregular spellings travel verbatim.
+            raw_ordinal = (row.get("Broj dokumenta") or "").strip()
+            link = (row.get("Poveznica") or "").strip()
+            ordinal: int | str
+            if raw_ordinal.isdigit() and link == site_url_for(year, issue_no, int(raw_ordinal)):
+                ordinal = int(raw_ordinal)
+            elif link == site_url_for(year, issue_no, raw_ordinal):
+                ordinal = raw_ordinal
+            else:
+                raise ValueError(
+                    f"{label}: link column {link!r} matches neither the "
+                    f"numeric form {site_url_for(year, issue_no, raw_ordinal) if raw_ordinal.isdigit() else '(non-numeric)'} "
+                    f"nor the verbatim form {site_url_for(year, issue_no, raw_ordinal)} — "
+                    "identity basis drift"
+                )
 
             native_type = (row.get("Vrsta dokumenta") or "").strip()
             subtype = (row.get("Podvrsta dokumenta (ako je dokument razvrstan u vrstu ostalo)") or "").strip()
