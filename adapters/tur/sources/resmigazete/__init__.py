@@ -55,7 +55,7 @@ from __future__ import annotations
 from datetime import UTC, date, datetime, timedelta
 from typing import Any
 
-from adapters.base import SourceDefinition, TaskSeed
+from adapters.base import CleanDefinition, SourceDefinition, TaskSeed
 
 __all__ = [
     "API_BASE",
@@ -144,6 +144,7 @@ def start_tasks(params: dict[str, Any]) -> list[TaskSeed]:
 
 
 def build_source() -> SourceDefinition:
+    from adapters.tur.sources.resmigazete.clean import CLEAN_VERSION, RgCleanHandler
     from adapters.tur.sources.resmigazete.day import RgDayHandler
     from adapters.tur.sources.resmigazete.item import RgItemHandler
 
@@ -153,6 +154,17 @@ def build_source() -> SourceDefinition:
         task_types={
             "rg_day": RgDayHandler(),
             "rg_item": RgItemHandler(),
+            "rg_clean": RgCleanHandler(),
         },
+        # Mixed-carrier cleaning (scope user-confirmed 2026-10-16): the
+        # handler sniffs content magic — digital PDFs go through
+        # measure/geometry, Word-export HTML rides html_to_text, and
+        # scans/image-only slices/CID glyph soup/binary attachments are
+        # explained empties (~8,900 of 99,546; census in clean.py).
+        clean=CleanDefinition(
+            task_type="rg_clean",
+            version=CLEAN_VERSION,
+            targets=("rg_item",),
+        ),
         parallel_safe=True,  # stateless GETs, no cookies (probed 2026-09-27)
     )

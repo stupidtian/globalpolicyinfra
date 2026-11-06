@@ -61,17 +61,18 @@
 
 ## 3. 抓什么：任务类型清单
 
-每种任务 = 一次请求 + 一次解析。共 **5 种**：
+每种任务 = 一次请求 + 一次解析。共 **6 种**：
 
 | 任务类型 | 请求什么 | 产出什么 |
 |---|---|---|
 | `frl_day`（种子） | `Versions` 实体集，`registeredAt` 落在当日 00:00–23:59 的版本（`$top=100` 翻页） | 当日登记事件的标题去重清单 → 每标题一个 `frl_title`（携带最新登记时间作更新信号）；当日无事件（周末）= 合法空产出；推进日期游标 |
-| `frl_made`（种子） | `Titles` 实体集，`makingDate` 落在区间内的标题（`$select=id`、`$top=100` 翻页） | 历史回填入口：区间内**制定**的每部政策一个 `frl_title`；页满 100 续页；不动登记日游标（见第 7 节） |
-| `frl_title` | `Titles('{id}')?$expand=versions` | 标题台账一行 + 版本谱系整组重写（titles / title_versions 两表）；按抓取层派生 `frl_docs` |
+| `frl_made`（种子） | `Titles` 实体集，`makingDate` 落在区间内的标题（`$select=id`、`$top=100` 翻页） | 历史回填入口：区间内**制定**的每部政策一个 `frl_title`（或 `depts=1` 时一个 `frl_dept`）；页满 100 续页；不动登记日游标（见第 7 节） |
+| `frl_dept` | `Titles('{id}')?$expand=administeringDepartments` | 该标题的主管部门写入 `title_departments` 表（纯元数据，无下载、无下游）——历史语料的部门补抓通道 |
+| `frl_title` | `Titles('{id}')?$expand=versions,administeringDepartments` | 标题台账一行 + 版本谱系整组重写 + 主管部门（title_departments 表），并随链传递给文档；派生 `frl_docs` |
 | `frl_docs` | `Documents?$filter=titleId eq '{id}'` | 该版本全部可下载文件清单 → 选格式（EPUB 优先、PDF 兜底）→ 每份文件一个 `frl_doc` |
-| `frl_doc` | `documents/find(titleid='{id}',asat={版本生效日},type=...,format=...)` | 响应嗅探（JSON 信封 → base64 解码；裸流 → 直接收文件）+ ZIP/PDF 魔数校验 → 文件落盘 + documents 一行（挂靠标题实体） |
+| `frl_doc` | `documents/find(titleid='{id}',asat={版本生效日},type=...,format=...)` | 响应嗅探（JSON 信封 → base64 解码；裸流 → 直接收文件）+ ZIP/PDF 魔数校验 → 文件落盘 + documents 一行（挂靠标题实体，`issuing_authority` 带主管部门） |
 
-任务链：`frl_day` 或 `frl_made` → `frl_title → frl_docs → frl_doc`。一请求 = 一份完整文件（无第二跳）。两个入口可在同一账本上任意混用：已抓过的标题无论从哪个入口再遇到都自动跳过。
+任务链：`frl_day` 或 `frl_made` → `frl_title → frl_docs → frl_doc`（`depts=1` 时 `frl_made → frl_dept`，只补部门）。一请求 = 一份完整文件（无第二跳）。两个入口可在同一账本上任意混用：已抓过的标题无论从哪个入口再遇到都自动跳过。
 
 命令行参数（key=value 形式）：
 
@@ -81,6 +82,7 @@ sync=1            增量：起点 = 游标 frl_last_date 的次日，终点 = �
 made=FROM:TO      回填入口：制定日落在区间内的全部政策（时间序列语料用这个）
 layer=full|asmade 抓取层：full = 颁布原样版+最新编纂版+解释声明（默认）；
                   asmade = 只要颁布原样版（时间序列口径，无编纂无解释声明）
+depts=1           made 扫描只补主管部门元数据（frl_dept，不下载文件不清文本）
 max_titles=N      每个枚举任务实际深抓的标题数上限（测试护栏，枚举不受限）
 comp=anchor|all   layer=full 时的编纂层口径（默认只抓最新编纂版）
 gazette=0|1       公报是否下载正文（默认 0：标题台账保留公报条目）
@@ -88,13 +90,14 @@ gazette=0|1       公报是否下载正文（默认 0：标题台账保留公报
 
 ## 4. 数据落到哪
 
-**两张领域表 + documents 表 + 每标题一个文件夹**。与"扁平文档型"国家（法国/德国公报）不同，登记册的条目不是一次性出版物而是**持续演化的实体**：一部法的 as-made 与第 69 号编纂版是同一标题的两个时点，因此建立标题实体，全部版本文档挂靠其下。
+**三张领域表 + documents 表 + 每标题一个文件夹**。与"扁平文档型"国家（法国/德国公报）不同，登记册的条目不是一次性出版物而是**持续演化的实体**：一部法的 as-made 与第 69 号编纂版是同一标题的两个时点，因此建立标题实体，全部版本文档挂靠其下。
 
 | 位置 | 记什么 |
 |---|---|
 | `titles` 表 | 标题台账一行：稳定 id、名称、collection、状态（InForce/Ceased/Repealed/NeverEffective）、制定日、是否主体法、年/号/系列、现行版本指针、**废止链（status_history：谁在何日以何条款废止了它）** |
 | `title_versions` 表 | 版本谱系：一版本一行（标题 id + 生效窗口起点为主键），编纂号、登记时间、是否现行/最新、**修订影响注记（reasons：哪部修订法哪些条款促成了这个时点）** |
-| `documents` 表 | 一份文件一行：as-made、ES、编纂版都是文档，`entity_ref='titles:{title_id}'` 挂靠标题 |
+| `title_departments` 表 | 主管部门：一标题一行（当前 administering department，如 "Department of the Treasury"）；标题级事实的持久层，政府改组后重扫即可刷新 |
+| `documents` 表 | 一份文件一行：as-made、ES、编纂版都是文档，`entity_ref='titles:{title_id}'` 挂靠标题，`issuing_authority` = 该标题主管部门（经链路传递写入；历史批次由传播脚本从 title_departments 回填） |
 | `01_raw/frl/{id 前两位}/{title_id}/` | 该标题的全部材料（人读镜像，路径入账） |
 
 documents 主要字段：
@@ -210,8 +213,8 @@ python cli.py requeue --country aus
 | 文件下载 | `/documents/find(titleid='{id}',asat={YYYY-MM-DD},type='Primary'\|'ES',format='Epub'\|'Pdf',uniqueTypeNumber=0,volumeNumber=0,rectificationVersionNumber=0)` → JSON 信封，`bytes` 字段 base64 |
 | 计数 | `/Titles/$count`（裸用或配 seriesType；配 collection 过滤会返回错误哨兵值）；collection 过滤的普通查询自动附 `@odata.count` |
 
-**源里还有但暂未用的**（每项 = 将来可加一种任务类型）：修订影响网络 `Affects`（谁修订/废止了谁，跨标题政策影响链）、主管部门 `Departments`（部委维度）、议会审查事件 `ParliamentaryScrutiny`（文书提交议会与驳回动议）、日落条款检索 `_FutureSunsetDateSearch`、时点检索 `_PointInTimeSearch`、全文检索 `_TextSearchContexts`、议会原法案链接（`originatingBillUri` → parlinfo.aph.gov.au）。
+**源里还有但暂未用的**（每项 = 将来可加一种任务类型）：修订影响网络 `Affects`（谁修订/废止了谁，跨标题政策影响链）、议会审查事件 `ParliamentaryScrutiny`（文书提交议会与驳回动议）、日落条款检索 `_FutureSunsetDateSearch`、时点检索 `_PointInTimeSearch`、全文检索 `_TextSearchContexts`、议会原法案链接（`originatingBillUri` → parlinfo.aph.gov.au）。
 
 ---
 
-*更新日期：2026-10-02；数据快照：2026-10-02；数据由 made=2000-01-01:2025-12-31 layer=asmade 全量回填实跑背书（77,065 标题 / 76,664 文档 / 2.47 GB，磁盘≡账本逐文件哈希全核验，Act 年度顺序号 2005–2025 无缺号），此前另有 window/sync 小窗口与 2010 单年试跑（报告见 docs/tasks/2026-08-30-aus/）。*
+*更新日期：2026-11-05；数据快照：2026-11-05；数据由 made=2000-01-01:2025-12-31 layer=asmade 全量回填实跑背书（77,065 标题 / 76,664 文档 / 2.47 GB，磁盘≡账本逐文件哈希全核验），正文清理全量背书（76,659 份 txt），主管部门全量补抓背书（title_departments 78,227 行、documents.issuing_authority 75,633/76,664 填充、86 个部门；2026-11-05 快照）。*

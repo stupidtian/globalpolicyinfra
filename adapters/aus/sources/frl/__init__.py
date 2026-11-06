@@ -204,7 +204,13 @@ def _mode(params: dict[str, Any]) -> dict[str, str]:
     layer = str(params.get("layer", LAYER_FULL)).strip()
     if layer not in (LAYER_FULL, LAYER_ASMADE):
         raise _fail(f"layer must be full or asmade (got {layer!r})")
-    return {"comp": comp, "gazette": "1" if gazette else "0", "layer": layer}
+    depts = str(params.get("depts", "0")).strip() in ("1", "true", "yes")
+    return {
+        "comp": comp,
+        "gazette": "1" if gazette else "0",
+        "layer": layer,
+        "depts": "1" if depts else "0",
+    }
 
 
 def _max_titles(params: dict[str, Any]) -> str:
@@ -301,11 +307,16 @@ CREATE TABLE IF NOT EXISTS title_versions (
     reasons TEXT,
     PRIMARY KEY (title_id, start)
 );
+CREATE TABLE IF NOT EXISTS title_departments (
+    title_id TEXT PRIMARY KEY,
+    department TEXT NOT NULL
+);
 """
 
 def build_source() -> SourceDefinition:
     from adapters.aus.sources.frl.clean import CLEAN_VERSION, FrlCleanHandler
     from adapters.aus.sources.frl.day import FrlDayHandler
+    from adapters.aus.sources.frl.dept import FrlDeptHandler
     from adapters.aus.sources.frl.doc import FrlDocHandler
     from adapters.aus.sources.frl.docs import FrlDocsHandler
     from adapters.aus.sources.frl.made import FrlMadeHandler
@@ -317,14 +328,19 @@ def build_source() -> SourceDefinition:
         task_types={
             "frl_day": FrlDayHandler(),
             "frl_made": FrlMadeHandler(),
+            "frl_dept": FrlDeptHandler(),
             "frl_title": FrlTitleHandler(),
             "frl_docs": FrlDocsHandler(),
             "frl_doc": FrlDocHandler(),
             "frl_clean": FrlCleanHandler(),
         },
         domain_schema=DOMAIN_SCHEMA,
-        domain_tables=("titles", "title_versions"),
-        domain_keys={"titles": ("title_id",), "title_versions": ("title_id", "start")},
+        domain_tables=("titles", "title_versions", "title_departments"),
+        domain_keys={
+            "titles": ("title_id",),
+            "title_versions": ("title_id", "start"),
+            "title_departments": ("title_id",),
+        },
         # no cookies, no tokens, no cross-task transport state (probed
         # 2026-08-31): every task is an independent keyless GET
         parallel_safe=True,

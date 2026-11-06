@@ -148,6 +148,7 @@ class FrlDocHandler:
                     title=doc_title,
                     source_url=source_url,
                     publication_date=publication_date,
+                    issuing_authority=task.params.get("dept") or None,
                     doc_type=doc_type,
                     entity_ref=f"titles:{title_id}",
                     language="eng",

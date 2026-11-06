@@ -53,7 +53,10 @@ class FrlTitleHandler:
     def build_request(self, task: TaskView) -> RequestSpec:
         title_id = str(task.params["title_id"])
         # top=None: a $top on the expanded singleton read is a server 400
-        return RequestSpec(url=odata_url(f"/Titles('{title_id}')", expand="versions", top=None))
+        # (quirk ⑤); sibling expands (versions + departments) probed OK
+        return RequestSpec(url=odata_url(
+            f"/Titles('{title_id}')", expand="versions,administeringDepartments",
+            top=None))
 
     def parse(self, response: Response, task: TaskView) -> TaskResult:
         if response.status_code != 200:
@@ -68,6 +71,12 @@ class FrlTitleHandler:
         versions = title.get("versions") or []
         if not versions:
             raise ValueError(f"title {title['id']} carries no versions")
+
+        department = "; ".join(
+            str(d.get("name") or "").strip()
+            for d in (title.get("administeringDepartments") or [])
+            if d.get("name")
+        ) or None
 
         current_start = next(
             (v["start"][:10] for v in versions if v.get("isCurrent")), None
@@ -144,6 +153,7 @@ class FrlTitleHandler:
                         "comp": comp,
                         "name": title_row["name"],
                         "collection": collection,
+                        "dept": department,
                         "publication_date": (
                             title_row["making_date"]
                             if as_made
@@ -168,8 +178,13 @@ class FrlTitleHandler:
         title_id = str(title["id"])
         folder = f"01_raw/frl/{title_id[:2]}/{title_id}"
         title_row["raw_path"] = f"{folder}/title.json"
+        upserts: dict[str, list[dict[str, str | None]]] = {"titles": [title_row]}
+        if department:
+            upserts["title_departments"] = [
+                {"title_id": title_id, "department": department}
+            ]
         return TaskResult(
-            upsert_rows={"titles": [title_row]},
+            upsert_rows=upserts,
             replacements=[
                 ReplaceRows(
                     table="title_versions",
