@@ -53,10 +53,15 @@ class FrlMadeHandler:
             "comp": str(task.params.get("comp", "anchor")),
             "gazette": str(task.params.get("gazette", "0")),
             "layer": str(task.params.get("layer", "full")),
+            "depts": str(task.params.get("depts", "0")),
         }
         title_ids = sorted({row["id"] for row in rows if row.get("id")})
+        # depts=1: metadata-only backfill of the administering department —
+        # one frl_dept per title (no version lineage, no downloads); the
+        # documents and files of the corpus are not touched by this sweep
+        spawn_type = "frl_dept" if mode["depts"] == "1" else "frl_title"
         seeds = [
-            TaskSeed(type="frl_title", params={**mode, "title_id": title_id})
+            TaskSeed(type=spawn_type, params={**mode, "title_id": title_id})
             for title_id in title_ids
         ]
         max_titles = task.params.get("max_titles")

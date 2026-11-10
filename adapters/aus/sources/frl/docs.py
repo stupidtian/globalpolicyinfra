@@ -90,6 +90,7 @@ class FrlDocsHandler:
                         # raw-stream downloads carry no envelope, so the
                         # document title can only come from the chain
                         "name": task.params.get("name"),
+                        "dept": task.params.get("dept"),
                         "collection": task.params.get("collection", ""),
                         "publication_date": task.params.get("publication_date"),
                     },
