@@ -586,7 +586,18 @@ def _horizontal_pages_text(
     digit-normalized text repeats on >= max(3, 60% of pages)), columns
     ordered by x0 modes with full-width lines first. Returns the line list
     per input page (same order, same count)."""
-    page_lines = [_assemble_lines(_page_chars(p, max_char_height)) for p in pages]
+    return _horizontal_entries_text(
+        [_assemble_lines(_page_chars(p, max_char_height)) for p in pages]
+    )
+
+
+def _horizontal_entries_text(
+    page_lines: list[list[tuple[float, float, float, str]]],
+) -> list[list[str]]:
+    """The chrome/column logic of :func:`_horizontal_pages_text` over
+    pre-assembled line entries — the form the streaming geometry twin
+    (:func:`geometry_pdf_to_text_streamed`) feeds it, since it cannot
+    afford to hold the LTPage objects of a whole oversized document."""
     n_pages = max(1, len(page_lines))
     counter: Counter[str] = Counter(
         _norm_repeats(t) for lines in page_lines for _, _, _, t in lines if t
@@ -630,8 +641,13 @@ def measure_pdf(data: bytes) -> dict[str, float | int]:
     mode count), ``vertical_share`` (tategaki signature, 0.0 when no CJK),
     ``image_coverage``, ``cjk_share``. This is the measurement half of the
     routing contract: country declarations branch on these keys.
+
+    Pages stream through one at a time (the stats are per-page
+    aggregates) — materializing the full page list raised MemoryError on
+    oversized documents (TUR's 308 MB decree, probed 2026-11-03).
     """
-    pages = list(extract_pages(io.BytesIO(data), laparams=LAParams()))
+    pages_iter = extract_pages(io.BytesIO(data), laparams=LAParams())
+    page_count = 0
     chars = 0
     cjk = 0
     vertical_chars = 0
@@ -639,7 +655,8 @@ def measure_pdf(data: bytes) -> dict[str, float | int]:
     image_area = 0.0
     page_area = 0.0
     columns_max = 0
-    for page in pages:
+    for page in pages_iter:
+        page_count += 1
         pw, ph = page.width, page.height
         page_area += pw * ph
         pcs = _page_chars(page)
@@ -658,7 +675,7 @@ def measure_pdf(data: bytes) -> dict[str, float | int]:
         vs = _vertical_share(pcs)
         vertical_chars += round(vs * len([c for c in pcs if _CJK.search(c.get_text())]))
     return {
-        "pages": len(pages),
+        "pages": page_count,
         "chars": chars,
         "text_coverage": round(char_area / page_area, 4) if page_area else 0.0,
         "columns": columns_max,
@@ -709,6 +726,54 @@ def geometry_pdf_to_text(
         lines.append("")  # page boundary
     out: list[str] = []
     for line in lines:
+        folded = _WHITESPACE_RUN.sub(" ", line).strip()
+        if folded:
+            out.append(folded)
+    return "\n".join(out) + "\n" if out else ""
+
+
+def geometry_pdf_to_text_streamed(
+    data: bytes, *, max_char_height: float | None = None
+) -> str:
+    """Page-streaming twin of :func:`geometry_pdf_to_text` for documents
+    whose full page list does not fit in memory (probed 2026-11-03: TUR's
+    largest item, a 308 MB SOLAS-annex decree — ``list(extract_pages(...))``
+    raises MemoryError on 8 GB because every LTChar object of every page
+    stays live until the list completes).
+
+    Same per-page geometry (vertical detection, header/footer removal,
+    column ordering) and the same output contract as
+    :func:`geometry_pdf_to_text`. The difference is retention: the page
+    generator is consumed one page at a time and only extracted line
+    strings survive each iteration. Horizontal pages' assembled line
+    entries are still collected across the whole document before assembly
+    — shared header/footer detection is defined over the full page set —
+    but line entries are tuples of two floats and one short string, orders
+    of magnitude lighter than the layout objects they stand in for.
+
+    Callers route by size (e.g. adapters/tur clean: >= 100 MB streamed);
+    small documents stay on :func:`geometry_pdf_to_text` byte-for-byte.
+    """
+    fp = io.BytesIO(data)
+    slots: list[list[str] | None] = []  # final lines per page; None = pending horizontal
+    horizontal: list[list[tuple[float, float, float, str]]] = []
+    horizontal_slots: list[int] = []
+    for page in extract_pages(fp, laparams=LAParams()):
+        chars = _page_chars(page, max_char_height)
+        if _vertical_share(chars) >= 0.5:
+            slots.append(_vertical_page_text(page, max_char_height))
+        else:
+            horizontal.append(_assemble_lines(chars))
+            horizontal_slots.append(len(slots))
+            slots.append(None)
+    for slot, lines in zip(horizontal_slots, _horizontal_entries_text(horizontal)):
+        slots[slot] = lines
+    lines_out: list[str] = []
+    for page_lines in slots:
+        lines_out.extend(page_lines or [])
+        lines_out.append("")  # page boundary
+    out: list[str] = []
+    for line in lines_out:
         folded = _WHITESPACE_RUN.sub(" ", line).strip()
         if folded:
             out.append(folded)
